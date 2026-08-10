@@ -3,12 +3,13 @@ This module provides services related to SONiC images, including:
 1) Calculating checksums for images
 2) Listing images
 3) Setting the next boot image
-4) Handling gNOI OS.Install requests (not yet implemented)
+4) Handling gNOI OS.Install requests
 """
 
 import errno
 import hashlib
 import logging
+import os
 import subprocess
 import json
 
@@ -16,6 +17,14 @@ from host_modules import host_service
 from host_modules.file_path_policy import DENIED, open_checksum_file
 
 MOD_NAME = "image_service"
+
+# Host-side directory where the gNOI OS Install front-end (in the gnmi
+# container) streams the image before this host service installs it.
+# The gnmi container writes to its ImgDir (`--img_dir /mnt/host/var/tmp` in
+# gnmi-native.sh), which is the /var/tmp:/mnt/host/var/tmp bind mount from
+# rules/docker-gnmi.mk. On the host that same file is at /var/tmp/<version>.
+# This constant MUST stay in sync with the container's --img_dir flag.
+GNOI_OS_HOST_IMG_DIR = "/var/tmp"
 
 logger = logging.getLogger(__name__)
 
@@ -151,26 +160,116 @@ class ImageService(host_service.HostModule):
     )
     def gnoi_install_os(self, options):
         """
-        Handles the gNOI OS Install RPC.
+        Handles the gNOI OS Install RPC (backend half).
+
+        The gnmi-container front-end (sonic-gnmi gnmi_server/gnoi_os.go) drives
+        the streaming transfer and calls this method twice via D-Bus:
+
+          1) TransferRequest phase -- input {"transferRequest": {"version": ...}}.
+             We validate the request and reply {"transferReady": {}} so the
+             front-end starts streaming the image bytes into
+             GNOI_OS_HOST_IMG_DIR/<version>. The raw image content is NOT sent
+             to this backend; the front-end writes it to the shared img_dir.
+
+          2) TransferEnd phase -- input {"transferEnd": {}}. The image has been
+             fully written; we install it with sonic-installer and reply
+             {"validated": {"version": ...}}.
+
+        All normal outcomes (including typed InstallError) are returned with
+        rc=0 and a protojson-encoded InstallResponse string, because the Go
+        DbusApi turns a non-zero rc into a generic gRPC error and only rc=0
+        bodies are unmarshalled back into an InstallResponse. A non-zero rc is
+        reserved for hard/parse failures.
 
         Args:
-            options (str): JSON-formatted InstallRequest from os.proto
+            options: JSON-encoded gNOI os.InstallRequest (delivered as a D-Bus
+                array of strings that we re-join).
 
         Returns:
-            int: 0 on success
-            str: JSON-encoded InstallResponse with TransferReady or TransferProgress or Validated msg
+            (int rc, str response): rc=0 with a protojson InstallResponse on any
+            handled outcome; rc=1 with a plain message on unparseable input.
         """
-        logger.info("installos: gNOI OS Install RPC called.")
+        logger.info("gnoi_install_os: gNOI OS Install RPC called.")
 
-        # Join list of strings into one JSON string
-        request_str = " ".join(options)
-        logger.info("InstallRequest JSON string: %s", request_str)
+        # The gnmi front-end sends the InstallRequest as a single JSON string.
+        # Depending on the D-Bus binding it arrives either as a plain str (real
+        # hardware) or as a list/tuple of str fragments (some bindings/tests);
+        # concatenate without inserting separators so the JSON is not mangled.
+        if isinstance(options, str):
+            request_str = options
+        else:
+            request_str = "".join(options)
+        logger.info("gnoi_install_os: InstallRequest JSON string: %s", request_str)
 
         try:
             request_json = json.loads(request_str)
-            logger.info("Parsed InstallRequest: %s", json.dumps(request_json, indent=2))
         except json.JSONDecodeError as e:
-            logger.error("Failed to parse InstallRequest JSON: %s", e)
+            logger.error("gnoi_install_os: Failed to parse InstallRequest JSON: %s", e)
             return 1, f"Invalid InstallRequest JSON: {e}"
 
-        return 1, "ERROR_UNIMPLEMENTED: OS Install not supported"
+        # --- TransferRequest phase -------------------------------------------
+        if "transferRequest" in request_json:
+            transfer_req = request_json.get("transferRequest") or {}
+            version = transfer_req.get("version", "")
+            if not version:
+                logger.error("gnoi_install_os: TransferRequest missing version")
+                return 0, json.dumps(
+                    {"installError": {"type": "PARSE_FAIL",
+                                      "detail": "TransferRequest must contain a version"}}
+                )
+            # Remember the version for the TransferEnd phase. The front-end
+            # serializes Install RPCs with a mutex, so a single pending version
+            # is sufficient.
+            self._gnoi_install_version = version
+            logger.info("gnoi_install_os: TransferRequest version=%s -> TransferReady", version)
+            return 0, json.dumps({"transferReady": {}})
+
+        # --- TransferEnd phase -----------------------------------------------
+        if "transferEnd" in request_json:
+            version = getattr(self, "_gnoi_install_version", "")
+            if not version:
+                logger.error("gnoi_install_os: TransferEnd without a prior TransferRequest")
+                return 0, json.dumps(
+                    {"installError": {"type": "UNSPECIFIED",
+                                      "detail": "TransferEnd received without a prior TransferRequest"}}
+                )
+
+            image_path = os.path.join(GNOI_OS_HOST_IMG_DIR, version)
+            if not os.path.isfile(image_path):
+                logger.error("gnoi_install_os: staged image not found at %s", image_path)
+                self._gnoi_install_version = ""
+                return 0, json.dumps(
+                    {"installError": {"type": "UNSPECIFIED",
+                                      "detail": "Transferred image not found at {}".format(image_path)}}
+                )
+
+            logger.info("gnoi_install_os: installing image %s (version=%s)", image_path, version)
+            cmd = ["/usr/local/bin/sonic-installer", "install", "-y", image_path]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            # Best-effort cleanup of the staged image regardless of outcome;
+            # sonic-installer copies it into the image store on success.
+            try:
+                os.remove(image_path)
+            except OSError:
+                pass
+            self._gnoi_install_version = ""
+
+            if result.returncode != 0:
+                detail = (result.stderr.decode(errors="replace").strip()
+                          or result.stdout.decode(errors="replace").strip()
+                          or "sonic-installer install failed")
+                logger.error("gnoi_install_os: install failed rc=%s: %s", result.returncode, detail)
+                return 0, json.dumps(
+                    {"installError": {"type": "INSTALL_RUN_PACKAGE", "detail": detail}}
+                )
+
+            logger.info("gnoi_install_os: install complete for version=%s", version)
+            return 0, json.dumps({"validated": {"version": version}})
+
+        # --- Anything else ---------------------------------------------------
+        logger.error("gnoi_install_os: unsupported InstallRequest type: %s", request_str)
+        return 0, json.dumps(
+            {"installError": {"type": "PARSE_FAIL",
+                              "detail": "Unsupported or unexpected InstallRequest message"}}
+        )
