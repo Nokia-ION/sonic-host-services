@@ -412,18 +412,146 @@ class TestImageService(object):
     @mock.patch("dbus.SystemBus")
     @mock.patch("dbus.service.BusName")
     @mock.patch("dbus.service.Object.__init__")
-    def test_gnoi_install_os_valid_json(self, MockInit, MockBusName, MockSystemBus):
+    def test_gnoi_install_os_transfer_request(self, MockInit, MockBusName, MockSystemBus):
         """
-        Test that gnoi_install_os handles valid JSON input and returns ERROR_UNIMPLEMENTED.
+        TransferRequest with a version should return TransferReady and remember
+        the version for the subsequent TransferEnd.
         """
         image_service = ImageService(mod_name="image_service")
-        options = ['{', '"version": "1.0.0"', '}']  # Valid JSON when joined
+        options = ['{"transferRequest": {"version": "SONiC.1.0.0"}}']
 
         rc, response = image_service.gnoi_install_os(options)
 
-        assert rc == 1
-        assert "ERROR_UNIMPLEMENTED" in response
+        assert rc == 0
+        assert json.loads(response) == {"transferReady": {}}
+        assert image_service._gnoi_install_version == "SONiC.1.0.0"
 
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_install_os_transfer_request_string_input(self, MockInit, MockBusName, MockSystemBus):
+        """
+        On real hardware the D-Bus arg arrives as a single string (not a list);
+        it must be used as-is and not mangled character-by-character.
+        """
+        image_service = ImageService(mod_name="image_service")
+        options = '{"transferRequest": {"version": "SONiC.1.0.0"}}'
+
+        rc, response = image_service.gnoi_install_os(options)
+
+        assert rc == 0
+        assert json.loads(response) == {"transferReady": {}}
+        assert image_service._gnoi_install_version == "SONiC.1.0.0"
+
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_install_os_transfer_request_missing_version(self, MockInit, MockBusName, MockSystemBus):
+        """
+        TransferRequest without a version should return a PARSE_FAIL InstallError.
+        """
+        image_service = ImageService(mod_name="image_service")
+        options = ['{"transferRequest": {}}']
+
+        rc, response = image_service.gnoi_install_os(options)
+
+        assert rc == 0
+        resp = json.loads(response)
+        assert resp["installError"]["type"] == "PARSE_FAIL"
+
+    @mock.patch("subprocess.run")
+    @mock.patch("os.remove")
+    @mock.patch("os.path.isfile", return_value=True)
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_install_os_transfer_end_success(
+        self, MockInit, MockBusName, MockSystemBus, mock_isfile, mock_remove, mock_run
+    ):
+        """
+        TransferEnd should install the staged image and return Validated.
+        """
+        image_service = ImageService(mod_name="image_service")
+        image_service._gnoi_install_version = "SONiC.1.0.0"
+        mock_result = mock.Mock()
+        mock_result.returncode = 0
+        mock_result.stdout = b""
+        mock_result.stderr = b""
+        mock_run.return_value = mock_result
+
+        rc, response = image_service.gnoi_install_os(['{"transferEnd": {}}'])
+
+        assert rc == 0
+        assert json.loads(response) == {"validated": {"version": "SONiC.1.0.0"}}
+        mock_run.assert_called_once_with(
+            ["/usr/local/bin/sonic-installer", "install", "-y", "/var/tmp/SONiC.1.0.0"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # pending version is cleared after install
+        assert image_service._gnoi_install_version == ""
+
+    @mock.patch("subprocess.run")
+    @mock.patch("os.remove")
+    @mock.patch("os.path.isfile", return_value=True)
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_install_os_transfer_end_install_failure(
+        self, MockInit, MockBusName, MockSystemBus, mock_isfile, mock_remove, mock_run
+    ):
+        """
+        A sonic-installer failure on TransferEnd should return a typed
+        INSTALL_RUN_PACKAGE InstallError (rc=0 so the front-end sees the typed error).
+        """
+        image_service = ImageService(mod_name="image_service")
+        image_service._gnoi_install_version = "SONiC.bad"
+        mock_result = mock.Mock()
+        mock_result.returncode = 1
+        mock_result.stdout = b""
+        mock_result.stderr = b"Error: bad image"
+        mock_run.return_value = mock_result
+
+        rc, response = image_service.gnoi_install_os(['{"transferEnd": {}}'])
+
+        assert rc == 0
+        resp = json.loads(response)
+        assert resp["installError"]["type"] == "INSTALL_RUN_PACKAGE"
+        assert "bad image" in resp["installError"]["detail"]
+
+    @mock.patch("os.path.isfile", return_value=False)
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_install_os_transfer_end_missing_image(
+        self, MockInit, MockBusName, MockSystemBus, mock_isfile
+    ):
+        """
+        TransferEnd when the staged image is absent should return an InstallError.
+        """
+        image_service = ImageService(mod_name="image_service")
+        image_service._gnoi_install_version = "SONiC.1.0.0"
+
+        rc, response = image_service.gnoi_install_os(['{"transferEnd": {}}'])
+
+        assert rc == 0
+        resp = json.loads(response)
+        assert resp["installError"]["type"] == "UNSPECIFIED"
+
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_install_os_transfer_end_without_request(self, MockInit, MockBusName, MockSystemBus):
+        """
+        TransferEnd with no prior TransferRequest should return an InstallError.
+        """
+        image_service = ImageService(mod_name="image_service")
+
+        rc, response = image_service.gnoi_install_os(['{"transferEnd": {}}'])
+
+        assert rc == 0
+        resp = json.loads(response)
+        assert resp["installError"]["type"] == "UNSPECIFIED"
 
     @mock.patch("dbus.SystemBus")
     @mock.patch("dbus.service.BusName")
