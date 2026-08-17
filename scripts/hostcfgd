@@ -1759,13 +1759,16 @@ class DeviceMetaCfg(object):
 
     def __init__(self):
         self.hostname = ''
+        self.domain_name = ''
         self.timezone = None
         self.syslog_with_osversion = None
 
     def load(self, dev_meta={}):
         # Get hostname initial
         self.hostname = dev_meta.get('localhost', {}).get('hostname', '')
+        self.domain_name = dev_meta.get('localhost', {}).get('domain_name', '')
         syslog.syslog(syslog.LOG_DEBUG, f'Initial hostname: {self.hostname}')
+        syslog.syslog(syslog.LOG_DEBUG, f'Initial domain_name: {self.domain_name}')
 
         # Load appropriate config
         self.timezone = dev_meta.get('localhost', {}).get('timezone')
@@ -1801,6 +1804,28 @@ class DeviceMetaCfg(object):
                                               ' hostname: {}'.format(e))
                 return
             run_cmd(['sudo', 'monit', 'reload'])
+
+    def domain_name_update(self, data):
+        """
+        Apply domain name handler.
+
+        Args:
+            data: Read table's key's data.
+        """
+        syslog.syslog(syslog.LOG_DEBUG, 'DeviceMetaCfg: domain_name update')
+        new_domain_name = data.get('domain_name', '')
+
+        if new_domain_name == self.domain_name:
+            syslog.syslog(syslog.LOG_INFO,
+                          'Domain name was not updated: Already set up with the same value: {}'.format(self.domain_name))
+            return
+
+        syslog.syslog(syslog.LOG_INFO, 'DeviceMetaCfg: Set new domain name: {}'.format(new_domain_name))
+        self.domain_name = new_domain_name
+        try:
+            run_cmd(['sudo', 'service', 'hostname-config', 'restart'], True, True)
+        except subprocess.CalledProcessError as e:
+            syslog.syslog(syslog.LOG_ERR, 'DeviceMetaCfg: Failed to set new domain name: {}'.format(e))
 
     def apply_timezone_if_needed(self, new_tz):
         """
@@ -2678,6 +2703,7 @@ class HostConfigDaemon:
             syslog.syslog(syslog.LOG_INFO, f'DeviceMeta handler: key {key} is not localhost')
             return
         self.devmetacfg.hostname_update(data)
+        self.devmetacfg.domain_name_update(data)
         self.devmetacfg.timezone_update(data)
         self.devmetacfg.rsyslog_config(data)
 
