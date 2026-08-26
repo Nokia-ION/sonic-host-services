@@ -60,12 +60,12 @@ LINUX_DEFAULT_PASS_MAX_DAYS = 99999
 LINUX_DEFAULT_PASS_WARN_AGE = 7
 
 # Ssh min-max values
-SSH_INT_VALUES=[ "authentication_retries", "login_timeout", "inactivity_timeout", "max_sessions" ]
+SSH_INT_VALUES=[ "authentication_retries", "login_timeout", "inactivity_timeout", "max_sessions", "dscp" ]
 SSH_MIN_VALUES={"authentication_retries": 3, "login_timeout": 1, "ports": 1,
-                "inactivity_timeout": 0, "max_sessions": 0}
+                "inactivity_timeout": 0, "max_sessions": 0, "dscp": 0}
 SSH_MAX_VALUES={"authentication_retries": 100, "login_timeout": 600,
                 "ports": 65535, "inactivity_timeout": 35000,
-                "max_sessions": 100}
+                "max_sessions": 100, "dscp": 63}
 SSH_CONFIG_NAMES={"authentication_retries": "MaxAuthTries",
                   "login_timeout": "LoginGraceTime",
                   "ports": "Port",
@@ -74,7 +74,8 @@ SSH_CONFIG_NAMES={"authentication_retries": "MaxAuthTries",
                   "password_authentication": "PasswordAuthentication",
                   "ciphers": "Ciphers",
                   "kex_algorithms": "KexAlgorithms",
-                  "macs": "MACs"}
+                  "macs": "MACs",
+                  "dscp": "IPQoS"}
 # Wildcard listeners restored whenever listen_addresses is absent/removed
 SSH_DEFAULT_LISTEN_ADDRESSES = [ "0.0.0.0", "::" ]
 
@@ -1382,6 +1383,11 @@ class SshServer(object):
                 if key == "inactivity_timeout":
                     # translate min to sec.
                     value = int(value) * 60
+                elif key == "dscp":
+                    # sshd IPQoS numeric argument is the raw IP ToS byte, i.e.
+                    # DSCP << 2. Store DSCP (0..63) in CONFIG_DB and render the
+                    # ToS byte here so 'dscp 32' becomes 'IPQoS 128' (== cs4).
+                    value = int(value) * 4
                 elif key == "password_authentication":
                     # translate boolean to yes/no
                     if isinstance(value, str):
