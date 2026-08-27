@@ -414,6 +414,42 @@ HOSTCFGD_TEST_SSH_SERVER_VECTOR = [
                         "sysrq_capabilities": "disabled"
                     }
                 }
+            },
+            "modify_dscp":{
+                "SSH_SERVER": {
+                    "POLICIES":{
+                        "dscp": "32"
+                    }
+                },
+                "DEVICE_METADATA": {
+                    "localhost": {
+                        "hostname": "radius",
+                    }
+                },
+                "FEATURE": {
+                    "dhcp_relay": {
+                        "auto_restart": "enabled",
+                        "has_global_scope": "True",
+                        "has_per_asic_scope": "False",
+                        "has_timer": "False",
+                        "high_mem_alert": "disabled",
+                        "set_owner": "kube",
+                        "state": "enabled"
+                    },
+                },
+                "KDUMP": {
+                    "config": {
+                        "enabled": "false",
+                        "num_dumps": "3",
+                        "memory": "0M-2G:256M,2G-4G:320M,4G-8G:384M,8G-16G:448M,16G-32G:768M,32G-:1G"
+                    }
+                },
+                "SERIAL_CONSOLE": {
+                    "POLICIES":{
+                        "inactivity_timeout": "15",
+                        "sysrq_capabilities": "disabled"
+                    }
+                }
             }
         }
     ]
