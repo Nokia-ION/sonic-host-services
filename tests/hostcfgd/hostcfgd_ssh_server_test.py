@@ -251,6 +251,23 @@ class TestHostcfgdSSHServer(SshServerCheckConfigMixin, TestCase):
 
         self.check_config(test_name, test_data, "modify_all")
 
+    @parameterized.expand(HOSTCFGD_TEST_SSH_SERVER_VECTOR)
+    def test_hostcfgd_sshs_dscp(self, test_name, test_data):
+        """
+            Test SSHS hostcfd daemon renders the SSH_SERVER dscp policy as the
+            sshd IPQoS directive, converting DSCP (0..63) to the raw IP ToS byte
+            (dscp << 2), i.e. 'dscp 32' becomes 'IPQoS 128'.
+
+            Args:
+                test_name(str): test name
+                test_data(dict): test data which contains initial Config Db tables, and expected results
+
+            Returns:
+                None
+        """
+
+        self.check_config(test_name, test_data, "modify_dscp")
+
 
 class TestHostcfgdSSHServerListenAddresses(SshServerCheckConfigMixin, TestCase):
     """
