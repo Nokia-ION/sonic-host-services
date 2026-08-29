@@ -4,7 +4,6 @@ import os
 import sys
 
 from copy import copy
-from parameterized import parameterized
 from swsscommon import swsscommon
 from syslog import syslog, LOG_ERR
 from tests.hostcfgd.test_rsyslog_vectors \
@@ -110,3 +109,66 @@ class TestHostcfgdRSyslog(TestCase):
 
     def test_rsyslog_handle_the_same_config(self):
         self.assert_not_applied('initial')
+
+    def test_rsyslog_tls_missing_certs_sets_no_certificate(self):
+        orig_cache = copy(self.host_config_daemon.rsyslogcfg.cache)
+        with mock.patch.object(hostcfgd.RSyslogCfg, 'profile_files_ready',
+                               return_value=False):
+            self.update_config('add_tls_server')
+        assert self.host_config_daemon.rsyslogcfg.cache != orig_cache
+        state = self.host_config_daemon.state_db_conn
+        assert state.hget('SYSLOG_SERVER|10.0.0.5',
+                          'applied_transport_security') == 'false'
+        assert state.hget('SYSLOG_SERVER|10.0.0.5',
+                          'failure_reason') == 'NO_CERTIFICATE'
+        assert state.hget('SYSLOG_SERVER|1.1.1.1',
+                          'applied_transport_security') == 'false'
+        assert state.hget('SYSLOG_SERVER|1.1.1.1', 'failure_reason') == 'NONE'
+
+    def test_rsyslog_tls_ready_certs_sets_applied(self):
+        with mock.patch.object(hostcfgd.RSyslogCfg, 'profile_files_ready',
+                               return_value=True):
+            self.update_config('add_tls_server')
+        state = self.host_config_daemon.state_db_conn
+        assert state.hget('SYSLOG_SERVER|10.0.0.5',
+                          'applied_transport_security') == 'true'
+        assert state.hget('SYSLOG_SERVER|10.0.0.5', 'failure_reason') == 'NONE'
+
+    def test_profile_files_ready_requires_all_three(self):
+        with mock.patch('os.path.isfile', side_effect=lambda p: p.endswith('ca-bundle.pem')):
+            assert hostcfgd.RSyslogCfg.profile_files_ready('siem-east') is False
+        with mock.patch('os.path.isfile', return_value=True):
+            assert hostcfgd.RSyslogCfg.profile_files_ready('siem-east') is True
+        assert hostcfgd.RSyslogCfg.profile_files_ready('') is False
+        assert hostcfgd.RSyslogCfg.profile_files_ready(None) is False
+
+    def test_profile_files_ready_uses_ssl_certs_dir(self):
+        seen = []
+
+        def fake_isfile(path):
+            seen.append(path)
+            return True
+
+        with mock.patch('os.path.isfile', side_effect=fake_isfile):
+            assert hostcfgd.RSyslogCfg.profile_files_ready('siem-east') is True
+        assert any('/etc/sonic/ssl-certs/siem-east/' in path for path in seen)
+        assert not any('rsyslog-certs' in path for path in seen)
+
+    def test_ssl_profile_install_restarts_rsyslog_for_tls_row(self):
+        with mock.patch.object(hostcfgd.RSyslogCfg, 'profile_files_ready',
+                               return_value=True):
+            self.update_config('add_tls_server')
+            hostcfgd.run_cmd.reset_mock()
+            self.host_config_daemon.ssl_profile_handler(
+                'siem-east', 'SET', {'installed': 'true'})
+            hostcfgd.run_cmd.assert_called()
+            state = self.host_config_daemon.state_db_conn
+            assert state.hget('SYSLOG_SERVER|10.0.0.5',
+                              'applied_transport_security') == 'true'
+            assert state.hget('SYSLOG_SERVER|10.0.0.5', 'failure_reason') == 'NONE'
+
+    def test_ssl_profile_unused_id_does_not_restart(self):
+        hostcfgd.run_cmd.reset_mock()
+        self.host_config_daemon.ssl_profile_handler(
+            'other-id', 'SET', {'installed': 'true'})
+        hostcfgd.run_cmd.assert_not_called()
