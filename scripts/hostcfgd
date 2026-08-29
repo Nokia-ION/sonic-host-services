@@ -14,6 +14,7 @@ import jinja2
 import psutil
 import time
 import json
+import threading
 from shutil import copy2
 from datetime import datetime
 from sonic_py_common import device_info
@@ -2000,10 +2001,21 @@ class RSyslogCfg(object):
     Handles changes in syslog configuration tables:
         1) SYSLOG_CONFIG
         2) SYSLOG_SERVER
+
+    After regenerating rsyslog.conf, writes STATE_DB SYSLOG_SERVER|<addr>
+    applied_transport_security / failure_reason so operators can see whether
+    a TLS row actually got an ossl omfwd action. Certz Finalize publishes
+    STATE_DB SSL_PROFILE|<id>; hostcfgd restarts rsyslog-config when a syslog
+    row uses that id.
     """
 
-    def __init__(self):
+    SSL_CERTS_DIR = '/etc/sonic/ssl-certs'
+    DEST_FILES = ('ca-bundle.pem', 'cert.pem', 'key.pem')
+    STATE_TABLE = 'SYSLOG_SERVER'
+
+    def __init__(self, state_db_conn=None):
         self.cache = {}
+        self.state_db_conn = state_db_conn
 
     def load(self, rsyslog_config={}, rsyslog_servers={}):
         # Get initial remote syslog configuration
@@ -2013,6 +2025,77 @@ class RSyslogCfg(object):
         }
         syslog.syslog(syslog.LOG_INFO,
                       f'RSyslogCfg: Initial config: {self.cache}')
+        self._publish_tls_apply_state(rsyslog_servers, apply_ok=True)
+
+    @staticmethod
+    def _is_tls_server(conf):
+        if not isinstance(conf, dict):
+            return False
+        proto = str(conf.get('protocol', '')).lower()
+        ts = str(conf.get('transport_security', '')).lower()
+        return proto == 'tls' or ts in ('true', 'tls', 'enabled', '1')
+
+    @classmethod
+    def profile_files_ready(cls, profile_id):
+        """True if Certz host copies exist for this profile id."""
+        if not profile_id:
+            return False
+        dest_dir = os.path.join(cls.SSL_CERTS_DIR, profile_id)
+        return all(os.path.isfile(os.path.join(dest_dir, name))
+                   for name in cls.DEST_FILES)
+
+    def _set_state(self, server, applied, reason):
+        if self.state_db_conn is None:
+            return
+        key = '{}|{}'.format(self.STATE_TABLE, server)
+        try:
+            self.state_db_conn.hset(key, 'applied_transport_security',
+                                    'true' if applied else 'false')
+            self.state_db_conn.hset(key, 'failure_reason', reason)
+        except Exception as err:
+            syslog.syslog(syslog.LOG_ERR,
+                          f'RSyslogCfg: failed to write STATE_DB {key}: {err}')
+
+    def _delete_state(self, server):
+        if self.state_db_conn is None:
+            return
+        key = '{}|{}'.format(self.STATE_TABLE, server)
+        try:
+            delete = getattr(self.state_db_conn, 'delete', None)
+            if callable(delete):
+                delete(key)
+        except Exception as err:
+            syslog.syslog(syslog.LOG_ERR,
+                          f'RSyslogCfg: failed to delete STATE_DB {key}: {err}')
+
+    def _publish_tls_apply_state(self, rsyslog_servers, apply_ok=True):
+        """Record per-server TLS apply status. Missing certs never emit cleartext."""
+        servers = rsyslog_servers or {}
+        previous = set((self.cache.get('servers') or {}).keys())
+        current = set(servers.keys())
+        for server in previous - current:
+            self._delete_state(server)
+
+        for server, conf in servers.items():
+            if not self._is_tls_server(conf):
+                self._set_state(server, False, 'NONE')
+                continue
+            profile_id = (conf or {}).get('tls_profile_id')
+            if not profile_id:
+                syslog.syslog(syslog.LOG_ERR,
+                              f'RSyslogCfg: {server} TLS requested without tls_profile_id')
+                self._set_state(server, False, 'NO_PROFILE')
+                continue
+            if not self.profile_files_ready(profile_id):
+                syslog.syslog(syslog.LOG_ERR,
+                              f'RSyslogCfg: {server} TLS profile {profile_id} '
+                              f'missing files under {self.SSL_CERTS_DIR}')
+                self._set_state(server, False, 'NO_CERTIFICATE')
+                continue
+            if not apply_ok:
+                self._set_state(server, False, 'RSYSLOG_APPLY_FAILED')
+                continue
+            self._set_state(server, True, 'NONE')
 
     def update_rsyslog_config(self, rsyslog_config, rsyslog_servers):
         """Apply remote syslog configuration
@@ -2024,6 +2107,7 @@ class RSyslogCfg(object):
             rsyslog_servers:    Remote syslog servers
         """
         syslog.syslog(syslog.LOG_DEBUG, 'RSyslogCfg: Configuration update')
+        apply_ok = True
         if (self.cache.get('config', {}) != rsyslog_config or
             self.cache.get('servers', {}) != rsyslog_servers):
             syslog.syslog(syslog.LOG_INFO, f'RSyslogCfg: Set config '
@@ -2038,11 +2122,36 @@ class RSyslogCfg(object):
             except Exception:
                 syslog.syslog(syslog.LOG_ERR,
                               f'RSyslogCfg: Failed to restart rsyslog service')
+                apply_ok = False
+                self._publish_tls_apply_state(rsyslog_servers, apply_ok=False)
                 return
+
+        self._publish_tls_apply_state(rsyslog_servers, apply_ok=apply_ok)
 
         # Updating the cache
         self.cache['config'] = rsyslog_config
         self.cache['servers'] = rsyslog_servers
+
+    def force_reload(self):
+        """Restart rsyslog-config so Jinja re-scans /etc/sonic/ssl-certs.
+
+        Used when host PEMs appear or disappear (Certz Finalize / Delete)
+        without a CONFIG_DB SYSLOG_SERVER change.
+        """
+        servers = self.cache.get('servers') or {}
+        apply_ok = True
+        try:
+            run_cmd(['systemctl', 'reset-failed', 'rsyslog-config',
+                     'rsyslog'], log_err=True, raise_exception=True)
+            run_cmd(['systemctl', 'restart', 'rsyslog-config'],
+                    log_err=True, raise_exception=True)
+        except Exception:
+            syslog.syslog(syslog.LOG_ERR,
+                          'RSyslogCfg: Failed to restart rsyslog service')
+            apply_ok = False
+        self._publish_tls_apply_state(servers, apply_ok=apply_ok)
+        return apply_ok
+
 
 class DnsCfg:
 
@@ -2503,7 +2612,7 @@ class HostConfigDaemon:
         self.sshscfg = SshServer()
 
         # Initialize RSyslogCfg
-        self.rsyslogcfg = RSyslogCfg()
+        self.rsyslogcfg = RSyslogCfg(self.state_db_conn)
 
         # Initialize DnsCfg
         self.dnscfg = DnsCfg()
@@ -2728,6 +2837,49 @@ class HostConfigDaemon:
         syslog.syslog(syslog.LOG_INFO, 'SYSLOG_CONFIG table handler...')
         self.rsyslog_handler()
 
+    def ssl_profile_handler(self, key, op, data):
+        """Reload rsyslog when Certz host PEMs appear for a syslog TLS row."""
+        syslog.syslog(syslog.LOG_INFO,
+                      f'SSL_PROFILE handler... key={key} op={op}')
+        profile_id = key
+        rsyslog_servers = self.config_db.get_table(
+            swsscommon.CFG_SYSLOG_SERVER_TABLE_NAME) or {}
+        used = False
+        for row in rsyslog_servers.values():
+            if isinstance(row, dict) and row.get('tls_profile_id') == profile_id:
+                used = True
+                break
+        if not used:
+            return
+        rsyslog_config = self.config_db.get_table(
+            swsscommon.CFG_SYSLOG_CONFIG_TABLE_NAME) or {}
+        self.rsyslogcfg.cache['config'] = rsyslog_config
+        self.rsyslogcfg.cache['servers'] = rsyslog_servers
+        self.rsyslogcfg.force_reload()
+
+    def _ssl_profile_watch(self):
+        """STATE_DB SSL_PROFILE subscriber; runs in a daemon thread."""
+        try:
+            sel = swsscommon.Select()
+            sst = swsscommon.SubscriberStateTable(self.state_db_conn,
+                                                  'SSL_PROFILE')
+            sel.addSelectable(sst)
+        except Exception as err:
+            syslog.syslog(syslog.LOG_ERR,
+                          f'HostConfigDaemon: SSL_PROFILE watch init failed: {err}')
+            return
+        while True:
+            try:
+                state, _ = sel.select(1000)
+                if state != swsscommon.Select.OBJECT:
+                    continue
+                key, op, fvs = sst.pop()
+                data = dict(fvs) if fvs else {}
+                self.ssl_profile_handler(key, op, data)
+            except Exception as err:
+                syslog.syslog(syslog.LOG_ERR,
+                              f'HostConfigDaemon: SSL_PROFILE watch: {err}')
+
     def dns_nameserver_handler(self, key, op, data):
         syslog.syslog(syslog.LOG_INFO, 'DNS nameserver handler...')
         self.dnscfg.dns_update(key, data)
@@ -2831,6 +2983,9 @@ class HostConfigDaemon:
                                  make_callback(self.logging_handler))
 
     def start(self):
+        watch = threading.Thread(target=self._ssl_profile_watch,
+                                 name='ssl-profile-watch', daemon=True)
+        watch.start()
         self.config_db.listen(init_data_handler=self.load)
 
 def main():

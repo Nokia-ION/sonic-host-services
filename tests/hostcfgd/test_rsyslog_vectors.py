@@ -67,4 +67,20 @@ HOSTCFGD_TEST_RSYSLOG_VECTOR = {
         'SYSLOG_CONFIG': {},
         'SYSLOG_SERVER': {},
     },
+    'add_tls_server': {
+        'SYSLOG_SERVER': {
+            '1.1.1.1': {
+                'port': 'tcp',
+                'vrf': 'mgmt',
+                'filter': 'include',
+                'filter_regex': '^dsfdsdf$',
+                'severity': 'info'
+            },
+            '10.0.0.5': {
+                'protocol': 'tls',
+                'tls_profile_id': 'siem-east',
+                'port': '6514'
+            }
+        },
+    },
 }

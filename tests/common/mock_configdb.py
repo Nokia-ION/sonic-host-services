@@ -164,3 +164,6 @@ class MockDBConnector():
         if key not in self.data:
             self.data[key] = {}
         self.data[key][field] = value
+
+    def delete(self, key):
+        self.data.pop(key, None)
