@@ -1291,6 +1291,11 @@ class SshServer(object):
         # previously-applied restriction and leave stale ListenAddress
         # lines in place until an unrelated policy write occurs.
         self.listen_addresses_configured = self.is_listen_addresses_configured()
+        # Policy keys this daemon has rendered into sshd_config. Only these are
+        # removed again when they disappear from CONFIG_DB; directives that
+        # ship with the image (e.g. the ClientAliveInterval that
+        # build_debian.sh writes) are never touched.
+        self.applied_keys = set()
 
     def is_listen_addresses_configured(self):
         # A non-wildcard "ListenAddress" line in the live sshd_config means
@@ -1316,26 +1321,24 @@ class SshServer(object):
         self.modify_conf_file()
 
     def modify_conf_file(self):
-        ssh_policies = {}
-        ssh_policies.update(self.policies)
+        ssh_policies = dict(self.policies)
 
-        # set new SSH server policies. Also run when listen_addresses was
-        # previously applied so the wildcard listeners get restored even if
-        # no other policy is currently configured.
-        if len(ssh_policies) > 0 or self.listen_addresses_configured:
+        # Render when a policy is present, a previously rendered policy must be
+        # withdrawn, or listen_addresses was applied and now needs its wildcard
+        # listeners restored.
+        if ssh_policies or self.applied_keys or self.listen_addresses_configured:
             self.set_policies(ssh_policies)
 
     def policies_update(self, key, data, modify_conf=True):
         syslog.syslog(syslog.LOG_DEBUG, "ssh_policies_update - key: {}".format(key))
         syslog.syslog(syslog.LOG_DEBUG, "ssh_policies_update - data: {}".format(data))
-        if data:
-            if 'ports' in data:
-                data['ports'] = data['ports'].split(',')
-            self.policies = data
-        else:
-            # Key/row removed (e.g. whole POLICIES row deleted) - drop the
-            # stale policy state instead of silently re-applying it.
-            self.policies = {}
+        # data is the whole SSH_SERVER|POLICIES row, so a field that is missing
+        # from it has been deleted. The cache is replaced rather than merged,
+        # and an empty row is honored, so that set_policies can withdraw the
+        # directive instead of re-rendering the previous value.
+        self.policies = dict(data) if data else {}
+        if 'ports' in self.policies:
+            self.policies['ports'] = self.policies['ports'].split(',')
 
         if modify_conf:
             self.modify_conf_file()
@@ -1453,16 +1456,30 @@ class SshServer(object):
         for addr in addresses:
             modify_single_file_inplace(SSH_CONFG_TMP, [f'{line_num} {sed_cmd} ListenAddress {addr}'])
 
+    def remove_policy(self, key):
+        '''
+        Drop a directive this daemon wrote earlier so that sshd falls back to
+        its built-in default. Commented lines are left in place, so the stock
+        sshd_config documentation survives.
+        '''
+        name = SSH_CONFIG_NAMES.get(key)
+        if name is None:
+            return
+        syslog.syslog(syslog.LOG_INFO, "Removing sshd config directive {}".format(name))
+        modify_single_file_inplace(SSH_CONFG_TMP, ['-E', "/^" + name + "[[:blank:]=]/d"])
+
     def set_policies(self, ssh_policies):
         # Ssh server flow
         # The ssh_policies from CONFIG_DB will be set in the ssh config files /etc/ssh/sshd_config
         copy2(SSH_CONFG, SSH_CONFG_TMP)
 
+        rendered_keys = set()
         for key, value in ssh_policies.items():
             if key == 'ports':
                 if not self.handle_ports_set(value):
                     syslog.syslog(syslog.LOG_ERR, "Failed to update sshd config files - wrong port configuration")
                     return
+                rendered_keys.add(key)
                 continue
 
             if key == 'listen_addresses':
@@ -1510,6 +1527,7 @@ class SshServer(object):
                 kv_str = "{} {}".format(SSH_CONFIG_NAMES[key], str(value)) # name +' '+ value format
                 modify_single_file_inplace(SSH_CONFG_TMP,['-E', "/^#?" + SSH_CONFIG_NAMES[key]+"/{h;s/.*/"+
                  kv_str + "/};${x;/^$/{s//" + kv_str + "/;H};x}"])
+                rendered_keys.add(key)
             elif key in ['max_sessions']:
                 # Ignore, these parameters handled in other modules
                 continue
@@ -1522,10 +1540,16 @@ class SshServer(object):
             # Actively restore both IPv4/IPv6 wildcard listeners.
             self.restore_default_listen_addresses()
             self.listen_addresses_configured = False
+        # A field deleted from CONFIG_DB has to be deleted from sshd_config as
+        # well; sed only ever replaces or appends, so without this the previous
+        # value would stay in effect in the (persistent) config file.
+        for key in self.applied_keys - rendered_keys:
+            self.remove_policy(key)
 
         ssh_verify_res = subprocess.run(['sudo', 'sshd', '-T', '-f', SSH_CONFG_TMP], capture_output=True)
         if ssh_verify_res.returncode == 0:
             os.rename(SSH_CONFG_TMP, SSH_CONFG)
+            self.applied_keys = rendered_keys
             try:
                 run_cmd(['systemctl', 'restart', 'ssh'],
                         log_err=True, raise_exception=True)
