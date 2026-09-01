@@ -268,6 +268,52 @@ class TestHostcfgdSSHServer(SshServerCheckConfigMixin, TestCase):
 
         self.check_config(test_name, test_data, "modify_dscp")
 
+    @parameterized.expand(HOSTCFGD_TEST_SSH_SERVER_VECTOR)
+    def test_hostcfgd_sshs_dscp_delete(self, test_name, test_data):
+        """
+            Test that deleting the SSH_SERVER dscp policy withdraws the IPQoS
+            directive again. sed only ever replaces or appends, so a directive
+            that is no longer in CONFIG_DB has to be deleted explicitly or it
+            stays in effect in the persistent sshd_config. Directives that came
+            with the image (here ClientAliveInterval) must survive untouched.
+
+            Args:
+                test_name(str): test name
+                test_data(dict): test data which contains initial Config Db tables, and expected results
+
+            Returns:
+                None
+        """
+        config_name = "modify_dscp"
+        op_path = output_path + "/" + test_name + "_" + config_name + "_delete"
+        sop_path_common = sample_output_path + "/" + test_name
+        hostcfgd.SSH_CONFG = op_path + "/sshd_config"
+        hostcfgd.SSH_CONFG_TMP = hostcfgd.SSH_CONFG + ".tmp"
+        shutil.rmtree(op_path, ignore_errors=True)
+        os.makedirs(op_path)
+        shutil.copyfile(sop_path_common + "/sshd_config.old", op_path + "/sshd_config")
+
+        MockConfigDb.set_config_db(test_data[config_name])
+        host_config_daemon = hostcfgd.HostConfigDaemon()
+
+        with mock.patch.object(hostcfgd, 'run_cmd'):
+            host_config_daemon.sshscfg.load(
+                host_config_daemon.config_db.get_table('SSH_SERVER'))
+
+            with open(hostcfgd.SSH_CONFG) as f:
+                rendered = f.read()
+            self.assertIn("IPQoS 128", rendered)
+            self.assertIn("ClientAliveInterval 900", rendered)
+
+            # An empty row is what the handler sees once the last field is gone.
+            host_config_daemon.sshscfg.policies_update('POLICIES', {})
+
+        with open(hostcfgd.SSH_CONFG) as f:
+            after_delete = f.read()
+        self.assertIsNone(re.search(r'^IPQoS', after_delete, re.M),
+                          "IPQoS directive was not withdrawn:\n" + after_delete)
+        self.assertIn("ClientAliveInterval 900", after_delete)
+
 
 class TestHostcfgdSSHServerListenAddresses(SshServerCheckConfigMixin, TestCase):
     """
