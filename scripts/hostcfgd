@@ -94,6 +94,9 @@ TACPLUS_SERVER_PASSKEY_DEFAULT = ""
 TACPLUS_SERVER_TIMEOUT_DEFAULT = "5"
 TACPLUS_SERVER_AUTH_TYPE_DEFAULT = "pap"
 TACPLUS_TRACEID_AUTHORIZATION_DEFAULT = False
+TACPLUS_SERVER_TCP_PORT_DEFAULT = "49"
+# Dedicated mangle chain holding the DSCP marking rules for TACACS+ traffic.
+TACPLUS_DSCP_CHAIN = "TACACS_DSCP"
 
 # RADIUS
 RADIUS_SERVER_AUTH_PORT_DEFAULT = "1812"
@@ -469,6 +472,11 @@ class AaaCfg(object):
         }
         self.tacplus_global = {}
         self.tacplus_servers = {}
+        # DSCP marking rules known to be installed in the TACACS_DSCP chain,
+        # keyed by IP version, so the chain is only touched on a change. None
+        # means the kernel state is unknown, which forces one reconcile after
+        # start and so clears rules a previous run left behind.
+        self.tacplus_dscp_rules = {'4': None, '6': None}
 
         self.radius_global_default = {
             'priority': 0,
@@ -580,6 +588,105 @@ class AaaCfg(object):
 
         if modify_conf:
             self.modify_conf_file()
+
+    def build_tacacs_dscp_rules(self, servers_conf, dscp):
+        '''
+        Build the DSCP marking rules for outgoing TACACS+ traffic, keyed by IP
+        version. Neither pam_tacplus nor libnss_tacplus can set the ToS byte on
+        their sockets, so the marking is done with iptables mangle rules that
+        match the traffic towards each configured server. An unset or invalid
+        dscp yields no rules, which clears the marking.
+        '''
+        rules = {'4': [], '6': []}
+        if dscp is None or dscp == '':
+            return rules
+
+        try:
+            dscp_val = int(dscp)
+        except (TypeError, ValueError):
+            syslog.syslog(syslog.LOG_ERR,
+                          "TACPLUS global: dscp '{}' is not a number, ignoring".format(dscp))
+            return rules
+        if not 0 <= dscp_val <= 63:
+            syslog.syslog(syslog.LOG_ERR,
+                          "TACPLUS global: dscp {} out of range 0..63, ignoring".format(dscp_val))
+            return rules
+
+        for server in servers_conf:
+            addr = server.get('ip', '')
+            try:
+                ver = '6' if isinstance(ipaddress.ip_address(addr), ipaddress.IPv6Address) else '4'
+            except ValueError:
+                # A hostname cannot be matched by iptables at rule install time.
+                syslog.syslog(syslog.LOG_WARNING,
+                              "TACPLUS_SERVER|{}: not an IP address, no DSCP marking".format(addr))
+                continue
+            port = server.get('tcp_port') or TACPLUS_SERVER_TCP_PORT_DEFAULT
+            rules[ver].append(['-p', 'tcp', '-d', addr, '--dport', str(port),
+                               '-j', 'DSCP', '--set-dscp', str(dscp_val)])
+
+        return rules
+
+    def probe_iptables(self, base, args):
+        '''
+        Run an iptables query and report whether it succeeded. The output is
+        discarded because these probes are expected to fail before the chain
+        has been set up, which is not an error worth logging.
+        '''
+        try:
+            return subprocess.call(base + args,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL) == 0
+        except Exception as err:
+            syslog.syslog(syslog.LOG_ERR, "{} - failed: {}".format(base + args, err))
+            return False
+
+    def apply_tacacs_dscp_rules(self, ver, rules):
+        '''
+        Rebuild the TACACS_DSCP mangle chain of one address family from the
+        given rules and report whether the chain ends up matching them. The
+        chain is flushed and refilled rather than edited so that removing the
+        dscp setting, or a server, also removes its marking.
+        '''
+        base = (['iptables'] if ver == '4' else ['ip6tables']) + ['-t', 'mangle']
+        chain = [TACPLUS_DSCP_CHAIN]
+
+        try:
+            if not rules:
+                # Nothing to mark. Clean out a chain an earlier run may have
+                # left behind, but never create one on a box that has no
+                # TACACS+ DSCP configured.
+                if self.probe_iptables(base, ['-S'] + chain):
+                    run_cmd(base + ['-F'] + chain, raise_exception=True)
+                return True
+
+            if not self.probe_iptables(base, ['-S'] + chain):
+                run_cmd(base + ['-N'] + chain, raise_exception=True)
+            if not self.probe_iptables(base, ['-C', 'OUTPUT', '-j'] + chain):
+                run_cmd(base + ['-A', 'OUTPUT', '-j'] + chain, raise_exception=True)
+
+            run_cmd(base + ['-F'] + chain, raise_exception=True)
+            for rule in rules:
+                run_cmd(base + ['-A'] + chain + rule, raise_exception=True)
+        except Exception:
+            # run_cmd has already logged the failure. Reporting it keeps the
+            # cache from advancing, so the next update retries the install.
+            return False
+
+        return True
+
+    def update_tacacs_dscp(self, servers_conf, dscp):
+        '''
+        Reconcile the installed TACACS+ DSCP marking with the configuration.
+        Does nothing once the chain already matches, so the usual AAA updates
+        (which all funnel through modify_conf_file) cost no iptables calls.
+        '''
+        rules = self.build_tacacs_dscp_rules(servers_conf, dscp)
+        for ver in ('4', '6'):
+            if self.tacplus_dscp_rules[ver] == rules[ver]:
+                continue
+            if self.apply_tacacs_dscp_rules(ver, rules[ver]):
+                self.tacplus_dscp_rules[ver] = rules[ver]
 
     def notify_audisp_tacplus_reload_config(self):
         pid = get_pid("/sbin/audisp-tacplus")
@@ -770,6 +877,8 @@ class AaaCfg(object):
                     continue
                 servers_conf.append(server)
             servers_conf = sorted(servers_conf, key=lambda t: int(t['priority']), reverse=True)
+
+        self.update_tacacs_dscp(servers_conf, tacplus_global.get('dscp'))
 
         radius_global = self.radius_global_default.copy()
         radius_global.update(self.radius_global)
