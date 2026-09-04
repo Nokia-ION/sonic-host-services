@@ -786,6 +786,14 @@ class ControlPlaneAclManager(logger.Logger):
         iptables_cmds.append(self.iptables_cmd_ns_prefix[namespace] + ['iptables', '-A', 'INPUT', '-p', 'udp', '--dport', '546:547', '-j', 'ACCEPT'])
         iptables_cmds.append(self.iptables_cmd_ns_prefix[namespace] + ['ip6tables', '-A', 'INPUT', '-p', 'udp', '--dport', '546:547', '-j', 'ACCEPT'])
 
+        # Add iptables/ip6tables commands to allow all incoming VRRP traffic.
+        # VRRP (IPv4) and VRRPv3 (IPv6) both use IP protocol 112. CoPP already
+        # traps VRRP to the CPU; without this ACCEPT the packets hit the
+        # control-plane catch-all DROP once any CTRLPLANE ACL is configured.
+        # TODO: Determine VRRP ACLs based on configured VRRP instances, and remove this blanket acceptance
+        iptables_cmds.append(self.iptables_cmd_ns_prefix[namespace] + ['iptables', '-A', 'INPUT', '-p', '112', '-j', 'ACCEPT'])
+        iptables_cmds.append(self.iptables_cmd_ns_prefix[namespace] + ['ip6tables', '-A', 'INPUT', '-p', '112', '-j', 'ACCEPT'])
+
         # Add iptables/ip6tables commands to allow all incoming BGP traffic
         # TODO: Determine BGP ACLs based on configured device sessions, and remove this blanket acceptance
         iptables_cmds.append(self.iptables_cmd_ns_prefix[namespace] + self.exclude_mgmt_port(['iptables', '-A', 'INPUT', '-p', 'tcp', '--dport', '179', '-j', 'ACCEPT']))
