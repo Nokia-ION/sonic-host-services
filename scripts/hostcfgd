@@ -700,21 +700,31 @@ class AaaCfg(object):
         except Exception as ex:
             syslog.syslog(syslog.LOG_WARNING, "Send SIGHUP to audisp-tacplus failed with exception: {}".format(ex))
 
-    def handle_radius_source_intf_ip_chg(self, key):
+    def handle_aaa_source_intf_ip_chg(self, key):
+        # The addresses of an interface changed. Re-render the AAA
+        # configuration if any client sources its traffic from that interface,
+        # since what gets written is the address, not the interface name.
+        #
+        # Callers pass either the deserialized CONFIG_DB key, whose first
+        # component is the interface, or the interface name on its own.
+        intf = key[0] if isinstance(key, (tuple, list)) else key
+
         modify_conf=False
         if 'src_intf' in self.radius_global:
-            if key[0] == self.radius_global['src_intf']:
+            if intf == self.radius_global['src_intf']:
                 modify_conf=True
         for addr in self.radius_servers:
             if ('src_intf' in self.radius_servers[addr]) and \
-                    (key[0] == self.radius_servers[addr]['src_intf']):
+                    (intf == self.radius_servers[addr]['src_intf']):
                 modify_conf=True
                 break
+        if intf == self.tacplus_global.get('src_intf'):
+            modify_conf=True
 
         if not modify_conf:
             return
 
-        syslog.syslog(syslog.LOG_INFO, 'RADIUS IP change - key:{}, current server info {}'.format(key, self.radius_servers))
+        syslog.syslog(syslog.LOG_INFO, 'AAA source interface IP change - key:{}, current server info {}'.format(key, self.radius_servers))
         self.modify_conf_file()
 
     def handle_radius_nas_ip_chg(self, key):
@@ -864,6 +874,23 @@ class AaaCfg(object):
             syslog.syslog(syslog.LOG_ERR, "TACPLUS: invalid source address; ignoring")
             tacplus_global.pop('src_ip')
         src_ip = tacplus_global.get('src_ip')
+
+        # TACACS+ can be pointed at an interface rather than an address (EOS
+        # 'ip tacacs source-interface', SONiC TACPLUS|global:src_intf). What
+        # the PAM and NSS configurations take is an address, so resolve it
+        # here. src_intf wins over src_ip, which is how RADIUS treats the pair.
+        src_intf = tacplus_global.get('src_intf')
+        if src_intf:
+            if src_ip:
+                syslog.syslog(syslog.LOG_INFO,
+        "TACPLUS|global: src_intf found. Ignoring src_ip")
+            # An interface that resolves to nothing leaves the client with no
+            # source address rather than with the one src_intf replaced.
+            src_ip = self.get_interface_ip(src_intf)
+            if not src_ip:
+                src_ip = None
+                syslog.syslog(syslog.LOG_WARNING,
+        "TACPLUS|global: src_intf {} has no usable IP addr.".format(src_intf))
 
         servers_conf = []
         if self.tacplus_servers:
@@ -2889,7 +2916,7 @@ class HostConfigDaemon:
     def mgmt_intf_handler(self, key, op, data):
         key = ConfigDBConnector.deserialize_key(key)
         mgmt_intf_name = self.__get_intf_name(key)
-        self.aaacfg.handle_radius_source_intf_ip_chg(mgmt_intf_name)
+        self.aaacfg.handle_aaa_source_intf_ip_chg(mgmt_intf_name)
         self.aaacfg.handle_radius_nas_ip_chg(mgmt_intf_name)
         self.mgmtifacecfg.update_mgmt_iface(mgmt_intf_name, key, data)
 
@@ -2906,23 +2933,23 @@ class HostConfigDaemon:
         self.iptables.iptables_handler(key, data, add)
         lpbk_name = self.__get_intf_name(key)
         self.ntpcfg.handle_ntp_source_intf_chg(lpbk_name)
-        self.aaacfg.handle_radius_source_intf_ip_chg(key)
+        self.aaacfg.handle_aaa_source_intf_ip_chg(key)
 
     def vlan_intf_handler(self, key, op, data):
         key = ConfigDBConnector.deserialize_key(key)
-        self.aaacfg.handle_radius_source_intf_ip_chg(key)
+        self.aaacfg.handle_aaa_source_intf_ip_chg(key)
 
     def vlan_sub_intf_handler(self, key, op, data):
         key = ConfigDBConnector.deserialize_key(key)
-        self.aaacfg.handle_radius_source_intf_ip_chg(key)
+        self.aaacfg.handle_aaa_source_intf_ip_chg(key)
 
     def portchannel_intf_handler(self, key, op, data):
         key = ConfigDBConnector.deserialize_key(key)
-        self.aaacfg.handle_radius_source_intf_ip_chg(key)
+        self.aaacfg.handle_aaa_source_intf_ip_chg(key)
 
     def phy_intf_handler(self, key, op, data):
         key = ConfigDBConnector.deserialize_key(key)
-        self.aaacfg.handle_radius_source_intf_ip_chg(key)
+        self.aaacfg.handle_aaa_source_intf_ip_chg(key)
 
     def ntp_global_handler(self, key, op, data):
         syslog.syslog(syslog.LOG_NOTICE, 'Handling NTP global config')

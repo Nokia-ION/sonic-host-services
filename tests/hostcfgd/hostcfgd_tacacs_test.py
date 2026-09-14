@@ -1,6 +1,7 @@
 import copy
 import importlib.machinery
 import importlib.util
+import copy
 import filecmp
 import shutil
 import os
@@ -109,6 +110,83 @@ class TestHostcfgdTACACS(TestCase):
                 dcmp.right + "/" + name)
         self.assertTrue(len(diff_output) == 0, diff_output)
 
+
+    def test_hostcfgd_tacacs_source_interface(self):
+        """
+            Test that a TACACS+ source interface reaches the rendered
+            configuration.
+
+            TACPLUS|global:src_intf names an interface (EOS 'ip tacacs
+            source-interface'), but what the PAM and NSS configurations take is
+            an address, so the interface has to be resolved to the address
+            configured on it.
+
+            Returns:
+                None
+        """
+        config = copy.deepcopy(dict(HOSTCFGD_TEST_TACACS_VECTOR)['TACACS']['config_db_tacacs'])
+        # The PAM configuration only carries TACACS+ servers, and so only
+        # carries a source address, when login authenticates against them.
+        config['AAA']['authentication']['login'] = 'tacacs+'
+        config['TACPLUS']['global']['src_intf'] = 'Loopback0'
+        config['LOOPBACK_INTERFACE'] = {'Loopback0|10.1.0.1/32': {}}
+
+        op_path = output_path + "/TACACS_source_interface"
+        # Only the sshd/login files this sample directory carries are used; the
+        # rendered output is asserted on directly rather than diffed against it.
+        sop_path = sample_output_path + "/TACACS_config_db_tacacs"
+        host_config_daemon = self.mock_hostcfgd({'src_intf': config}, 'src_intf', op_path, sop_path)
+
+        self.render_config_file(host_config_daemon)
+
+        with open(hostcfgd.NSS_TACPLUS_CONF) as f:
+            nss_conf = f.read()
+        self.assertIn("src_ip=10.1.0.1", nss_conf,
+                      "source interface was not resolved in tacplus_nss.conf:\n" + nss_conf)
+
+        with open(hostcfgd.PAM_AUTH_CONF) as f:
+            pam_conf = f.read()
+        self.assertIn("source_ip=10.1.0.1", pam_conf,
+                      "source interface was not resolved in common-auth-sonic:\n" + pam_conf)
+
+    def test_hostcfgd_tacacs_source_interface_without_address(self):
+        """
+            Test that an unusable TACACS+ source interface leaves the client
+            with no source address.
+
+            An interface named as the source but carrying no address resolves
+            to nothing. What is left behind must be nothing rather than the
+            address the interface was configured in place of, so that the
+            client never sources from somewhere it was told not to.
+
+            Returns:
+                None
+        """
+        config = copy.deepcopy(dict(HOSTCFGD_TEST_TACACS_VECTOR)['TACACS']['config_db_tacacs'])
+        config['AAA']['authentication']['login'] = 'tacacs+'
+        config['TACPLUS']['global']['src_intf'] = 'Loopback0'
+        config['TACPLUS']['global']['src_ip'] = '10.9.9.9'
+        config['LOOPBACK_INTERFACE'] = {}
+
+        op_path = output_path + "/TACACS_source_interface_no_address"
+        sop_path = sample_output_path + "/TACACS_config_db_tacacs"
+        host_config_daemon = self.mock_hostcfgd({'src_intf': config}, 'src_intf', op_path, sop_path)
+
+        self.render_config_file(host_config_daemon)
+
+        with open(hostcfgd.NSS_TACPLUS_CONF) as f:
+            nss_conf = f.read()
+        self.assertNotIn("src_ip=10.9.9.9", nss_conf,
+                         "source address survived an unusable source interface:\n" + nss_conf)
+
+        with open(hostcfgd.PAM_AUTH_CONF) as f:
+            pam_conf = f.read()
+        # The servers have to be there for their want of a source address to
+        # mean anything.
+        self.assertIn("pam_tacplus.so", pam_conf,
+                      "no TACACS+ servers were rendered, so the check below proves nothing:\n" + pam_conf)
+        self.assertNotIn("source_ip=10.9.9.9", pam_conf,
+                         "source address survived an unusable source interface:\n" + pam_conf)
 
     @parameterized.expand(HOSTCFGD_TEST_TACACS_VECTOR)
     def test_hostcfgd_tacacs(self, test_name, test_data):
