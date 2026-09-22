@@ -10,8 +10,13 @@ After a completed install, delete, or restore, notifies CONFIG_DB consumers
 via `_notify_consumers()` (syslog today: restart rsyslog-config only when a
 SYSLOG_SERVER row uses this tls_profile_id). Add future TLS consumers there.
 
+STATE_DB SSL_PROFILE|<id> tracks Certz profile existence on the host:
+AddProfile creates the key with installed=false; install_profile sets
+installed=true; DeleteProfile deletes the key.
+
 D-Bus names (matching sonic-gnmi DbusClient):
 
+    org.SONiC.HostService.ssl_profile.add_profile
     org.SONiC.HostService.ssl_profile.install_profile
     org.SONiC.HostService.ssl_profile.delete_profile
     org.SONiC.HostService.ssl_profile.create_checkpoint
@@ -198,7 +203,7 @@ def _dest_installed(profile_id):
 
 
 def _publish_ssl_profile_state(profile_id, installed):
-    """Best-effort STATE_DB SSL_PROFILE|<id> for show/status."""
+    """Create or update STATE_DB SSL_PROFILE|<id> installed=true/false."""
     try:
         from swsscommon import swsscommon
         db = swsscommon.SonicV2Connector()
@@ -208,6 +213,19 @@ def _publish_ssl_profile_state(profile_id, installed):
         db.close()
     except Exception as err:
         logger.warning('%s: STATE_DB SSL_PROFILE write failed: %s', MOD_NAME, err)
+
+
+def _delete_ssl_profile_state(profile_id):
+    """Remove STATE_DB SSL_PROFILE|<id> after Certz DeleteProfile."""
+    try:
+        from swsscommon import swsscommon
+        db = swsscommon.SonicV2Connector()
+        db.connect(db.STATE_DB)
+        key = '%s|%s' % (SSL_PROFILE_TABLE, profile_id)
+        db.delete(db.STATE_DB, key)
+        db.close()
+    except Exception as err:
+        logger.warning('%s: STATE_DB SSL_PROFILE delete failed: %s', MOD_NAME, err)
 
 
 def _profile_used_by_syslog(profile_id):
@@ -250,6 +268,16 @@ def _notify_consumers(profile_id):
 
 class SslProfile(host_service.HostModule):
     """DBus endpoint that stages host-readable TLS PEMs per Certz profile."""
+
+    @host_service.method(
+        host_service.bus_name(MOD_NAME), in_signature='s', out_signature='is')
+    def add_profile(self, profile_id):
+        """Record STATE_DB SSL_PROFILE|<id> installed=false (Certz AddProfile)."""
+        err = _validate_profile_id(profile_id)
+        if err:
+            return 1, err
+        _publish_ssl_profile_state(profile_id, False)
+        return 0, 'Successfully added SSL profile %s' % profile_id
 
     @host_service.method(
         host_service.bus_name(MOD_NAME), in_signature='ssss', out_signature='is')
@@ -304,7 +332,7 @@ class SslProfile(host_service.HostModule):
             logger.error('%s: delete_profile %s failed: %s', MOD_NAME, profile_id, exc)
             return 1, 'failed to delete profile %s: %s' % (profile_id, exc)
 
-        _publish_ssl_profile_state(profile_id, False)
+        _delete_ssl_profile_state(profile_id)
         _notify_consumers(profile_id)
         return 0, 'Successfully deleted SSL profile %s' % profile_id
 
