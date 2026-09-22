@@ -43,6 +43,7 @@ def fs(tls_mod, monkeypatch):
     monkeypatch.setattr(ssl_profile, 'ALLOWED_SOURCE_PREFIXES', (src_root,))
     monkeypatch.setattr(ssl_profile, '_ssl_certs_ids', lambda: (os.getuid(), os.getgid()))
     monkeypatch.setattr(ssl_profile, '_publish_ssl_profile_state', mock.Mock())
+    monkeypatch.setattr(ssl_profile, '_delete_ssl_profile_state', mock.Mock())
     monkeypatch.setattr(ssl_profile, '_profile_used_by_syslog', mock.Mock(return_value=False))
     monkeypatch.setattr(ssl_profile, '_restart_rsyslog_config', mock.Mock())
     # Collection-time os.remove, in case an earlier test leaked a mock onto os.remove.
@@ -53,6 +54,7 @@ def fs(tls_mod, monkeypatch):
         'dest_root': dest_root,
         'ckpt_root': ckpt_root,
         'state': ssl_profile._publish_ssl_profile_state,
+        'state_del': ssl_profile._delete_ssl_profile_state,
         'used': ssl_profile._profile_used_by_syslog,
         'restart': ssl_profile._restart_rsyslog_config,
     }
@@ -286,10 +288,23 @@ class TestSslProfile(object):
     def test_delete_profile_success(self, tls_mod, fs):
         src = _write_sources(fs['src_root'], PROFILE)
         tls_mod.install_profile(PROFILE, src['cert'], src['key'], src['ca'])
+        fs['state_del'].reset_mock()
         code, msg = tls_mod.delete_profile(PROFILE)
         assert code == 0, msg
         assert not os.path.isdir(os.path.join(fs['dest_root'], PROFILE))
+        fs['state_del'].assert_called_with(PROFILE)
+
+    def test_add_profile_records_not_installed(self, tls_mod, fs):
+        code, msg = tls_mod.add_profile(PROFILE)
+        assert code == 0, msg
         fs['state'].assert_called_with(PROFILE, False)
+        fs['restart'].assert_not_called()
+
+    def test_add_profile_rejects_gnxi(self, tls_mod, fs):
+        code, msg = tls_mod.add_profile('gnxi')
+        assert code == 1
+        assert 'gNMI' in msg
+        fs['state'].assert_not_called()
 
     def test_delete_profile_succeeds_even_if_syslog_still_references(self, tls_mod, fs):
         """Generic installer does not refuse based on SYSLOG_SERVER."""
