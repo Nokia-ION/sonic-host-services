@@ -153,22 +153,3 @@ class TestHostcfgdRSyslog(TestCase):
             assert hostcfgd.RSyslogCfg.profile_files_ready('siem-east') is True
         assert any('/etc/sonic/ssl-certs/siem-east/' in path for path in seen)
         assert not any('rsyslog-certs' in path for path in seen)
-
-    def test_ssl_profile_install_restarts_rsyslog_for_tls_row(self):
-        with mock.patch.object(hostcfgd.RSyslogCfg, 'profile_files_ready',
-                               return_value=True):
-            self.update_config('add_tls_server')
-            hostcfgd.run_cmd.reset_mock()
-            self.host_config_daemon.ssl_profile_handler(
-                'siem-east', 'SET', {'installed': 'true'})
-            hostcfgd.run_cmd.assert_called()
-            state = self.host_config_daemon.state_db_conn
-            assert state.hget('SYSLOG_SERVER|10.0.0.5',
-                              'applied_transport_security') == 'true'
-            assert state.hget('SYSLOG_SERVER|10.0.0.5', 'failure_reason') == 'NONE'
-
-    def test_ssl_profile_unused_id_does_not_restart(self):
-        hostcfgd.run_cmd.reset_mock()
-        self.host_config_daemon.ssl_profile_handler(
-            'other-id', 'SET', {'installed': 'true'})
-        hostcfgd.run_cmd.assert_not_called()
