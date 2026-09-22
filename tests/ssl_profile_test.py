@@ -43,6 +43,8 @@ def fs(tls_mod, monkeypatch):
     monkeypatch.setattr(ssl_profile, 'ALLOWED_SOURCE_PREFIXES', (src_root,))
     monkeypatch.setattr(ssl_profile, '_ssl_certs_ids', lambda: (os.getuid(), os.getgid()))
     monkeypatch.setattr(ssl_profile, '_publish_ssl_profile_state', mock.Mock())
+    monkeypatch.setattr(ssl_profile, '_profile_used_by_syslog', mock.Mock(return_value=False))
+    monkeypatch.setattr(ssl_profile, '_restart_rsyslog_config', mock.Mock())
     # Collection-time os.remove, in case an earlier test leaked a mock onto os.remove.
     monkeypatch.setattr(os, 'remove', _REAL_OS_REMOVE)
     yield {
@@ -51,6 +53,8 @@ def fs(tls_mod, monkeypatch):
         'dest_root': dest_root,
         'ckpt_root': ckpt_root,
         'state': ssl_profile._publish_ssl_profile_state,
+        'used': ssl_profile._profile_used_by_syslog,
+        'restart': ssl_profile._restart_rsyslog_config,
     }
     shutil.rmtree(root, ignore_errors=True)
 
@@ -119,17 +123,62 @@ class TestSslProfile(object):
             mode = stat.S_IMODE(os.stat(dest).st_mode)
             assert mode in (0o640, 0o644)
         fs['state'].assert_called_with(PROFILE, True)
-        # Generic installer must not restart rsyslog.
-        if hasattr(sub, 'run'):
-            sub.run.assert_not_called()
+        fs['restart'].assert_not_called()
 
-    def test_install_does_not_call_systemctl(self, tls_mod, fs):
+    def test_install_does_not_restart_when_profile_unused(self, tls_mod, fs):
         src = _write_sources(fs['src_root'], PROFILE)
         with mock.patch('subprocess.run') as run:
             code, msg = tls_mod.install_profile(
                 PROFILE, src['cert'], src['key'], src['ca'])
             assert code == 0, msg
             run.assert_not_called()
+        fs['restart'].assert_not_called()
+
+    def test_install_restarts_rsyslog_when_syslog_uses_profile(self, tls_mod, fs):
+        fs['used'].return_value = True
+        src = _write_sources(fs['src_root'], PROFILE)
+        code, msg = tls_mod.install_profile(
+            PROFILE, src['cert'], src['key'], src['ca'])
+        assert code == 0, msg
+        fs['restart'].assert_called_once()
+
+    def test_delete_restarts_rsyslog_when_syslog_uses_profile(self, tls_mod, fs):
+        src = _write_sources(fs['src_root'], PROFILE)
+        tls_mod.install_profile(PROFILE, src['cert'], src['key'], src['ca'])
+        fs['restart'].reset_mock()
+        fs['used'].return_value = True
+        code, msg = tls_mod.delete_profile(PROFILE)
+        assert code == 0, msg
+        fs['restart'].assert_called_once()
+
+    def test_restore_restarts_rsyslog_when_syslog_uses_profile(self, tls_mod, fs):
+        src = _write_sources(fs['src_root'], PROFILE, cert='v1')
+        tls_mod.install_profile(PROFILE, src['cert'], src['key'], src['ca'])
+        tls_mod.create_checkpoint(PROFILE)
+        src2 = _write_sources(fs['src_root'], PROFILE, cert='v2')
+        tls_mod.install_profile(PROFILE, src2['cert'], src2['key'], src2['ca'])
+        fs['restart'].reset_mock()
+        fs['used'].return_value = True
+        code, msg = tls_mod.restore_checkpoint(PROFILE)
+        assert code == 0, msg
+        fs['restart'].assert_called_once()
+
+    def test_checkpoint_does_not_restart_rsyslog(self, tls_mod, fs):
+        src = _write_sources(fs['src_root'], PROFILE)
+        tls_mod.install_profile(PROFILE, src['cert'], src['key'], src['ca'])
+        fs['used'].return_value = True
+        fs['restart'].reset_mock()
+        code, msg = tls_mod.create_checkpoint(PROFILE)
+        assert code == 0, msg
+        fs['restart'].assert_not_called()
+
+    def test_notify_consumers_only_restarts_syslog_when_used(self, fs):
+        fs['used'].return_value = False
+        ssl_profile._notify_consumers(PROFILE)
+        fs['restart'].assert_not_called()
+        fs['used'].return_value = True
+        ssl_profile._notify_consumers(PROFILE)
+        fs['restart'].assert_called_once()
 
     def test_install_ca_only(self, tls_mod, fs):
         src = _write_sources(fs['src_root'], PROFILE)
@@ -269,6 +318,42 @@ class TestSslProfile(object):
         with open(_dest_path(fs, OTHER_PROFILE, CERT_NAME)) as handle:
             assert handle.read() == 'west-v1'
 
-    def test_module_has_no_systemctl_helpers(self):
-        assert not hasattr(ssl_profile, '_reload_rsyslog')
-        assert not hasattr(ssl_profile, '_syslog_servers_using_profile')
+
+class TestNotifyConsumers(object):
+
+    def test_profile_used_by_syslog_reads_tls_profile_id(self):
+        fake_db = mock.Mock()
+        fake_db.get_table.return_value = {
+            '10.0.0.5': {'protocol': 'tls', 'tls_profile_id': PROFILE},
+        }
+        fake_cls = mock.Mock(return_value=fake_db)
+        swss = mock.MagicMock()
+        swss.ConfigDBConnector = fake_cls
+        with mock.patch.dict('sys.modules', {
+                'swsscommon': mock.MagicMock(),
+                'swsscommon.swsscommon': swss}):
+            assert ssl_profile._profile_used_by_syslog(PROFILE) is True
+            assert ssl_profile._profile_used_by_syslog('other') is False
+
+    def test_profile_used_by_syslog_false_on_empty_or_error(self):
+        fake_db = mock.Mock()
+        fake_db.get_table.return_value = {}
+        swss = mock.MagicMock()
+        swss.ConfigDBConnector = mock.Mock(return_value=fake_db)
+        with mock.patch.dict('sys.modules', {
+                'swsscommon': mock.MagicMock(),
+                'swsscommon.swsscommon': swss}):
+            assert ssl_profile._profile_used_by_syslog(PROFILE) is False
+        assert ssl_profile._profile_used_by_syslog('') is False
+        swss.ConfigDBConnector = mock.Mock(side_effect=RuntimeError('no redis'))
+        with mock.patch.dict('sys.modules', {
+                'swsscommon': mock.MagicMock(),
+                'swsscommon.swsscommon': swss}):
+            assert ssl_profile._profile_used_by_syslog(PROFILE) is False
+
+    def test_restart_rsyslog_config_invokes_systemctl(self):
+        with mock.patch('host_modules.ssl_profile.subprocess.run') as run:
+            ssl_profile._restart_rsyslog_config()
+            assert run.call_count == 2
+            assert run.call_args_list[0][0][0][:2] == ['systemctl', 'reset-failed']
+            assert run.call_args_list[1][0][0] == ['systemctl', 'restart', 'rsyslog-config']

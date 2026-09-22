@@ -6,8 +6,9 @@ One directory per SSL profile id:
 
     /etc/sonic/ssl-certs/<profile_id>/{cert,key,ca-bundle}.pem
 
-Does not restart consumers and does not look up SYSLOG_SERVER. Binding and
-reload stay in CONFIG_DB / hostcfgd for each application.
+After a completed install, delete, or restore, notifies CONFIG_DB consumers
+via `_notify_consumers()` (syslog today: restart rsyslog-config only when a
+SYSLOG_SERVER row uses this tls_profile_id). Add future TLS consumers there.
 
 D-Bus names (matching sonic-gnmi DbusClient):
 
@@ -23,6 +24,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 
 from host_modules import host_service
 
@@ -196,7 +198,7 @@ def _dest_installed(profile_id):
 
 
 def _publish_ssl_profile_state(profile_id, installed):
-    """Best-effort STATE_DB SSL_PROFILE|<id> so hostcfgd can reload consumers."""
+    """Best-effort STATE_DB SSL_PROFILE|<id> for show/status."""
     try:
         from swsscommon import swsscommon
         db = swsscommon.SonicV2Connector()
@@ -206,6 +208,44 @@ def _publish_ssl_profile_state(profile_id, installed):
         db.close()
     except Exception as err:
         logger.warning('%s: STATE_DB SSL_PROFILE write failed: %s', MOD_NAME, err)
+
+
+def _profile_used_by_syslog(profile_id):
+    """True if CONFIG_DB SYSLOG_SERVER has a row with this tls_profile_id."""
+    if not profile_id:
+        return False
+    try:
+        from swsscommon.swsscommon import ConfigDBConnector
+        db = ConfigDBConnector()
+        db.connect(wait_for_init=False, retry_on=False)
+        servers = db.get_table('SYSLOG_SERVER') or {}
+        for row in servers.values():
+            if isinstance(row, dict) and row.get('tls_profile_id') == profile_id:
+                return True
+    except Exception as err:
+        logger.warning('%s: CONFIG_DB SYSLOG_SERVER lookup failed: %s',
+                       MOD_NAME, err)
+    return False
+
+
+def _restart_rsyslog_config():
+    """Restart rsyslog-config so Jinja re-scans /etc/sonic/ssl-certs."""
+    try:
+        subprocess.run(['systemctl', 'reset-failed', 'rsyslog-config',
+                        'rsyslog'], check=False)
+        subprocess.run(['systemctl', 'restart', 'rsyslog-config'], check=True)
+    except Exception as err:
+        logger.warning('%s: failed to restart rsyslog-config: %s', MOD_NAME, err)
+
+
+def _notify_consumers(profile_id):
+    """Reload host services that bind this SSL profile in CONFIG_DB.
+
+    Add future TLS consumers here (RADIUS, OpenSSH, ...): check whether
+    the profile id is referenced, then restart that consumer's config unit.
+    """
+    if _profile_used_by_syslog(profile_id):
+        _restart_rsyslog_config()
 
 
 class SslProfile(host_service.HostModule):
@@ -245,6 +285,7 @@ class SslProfile(host_service.HostModule):
             return 1, 'failed to install profile %s: %s' % (profile_id, exc)
 
         _publish_ssl_profile_state(profile_id, True)
+        _notify_consumers(profile_id)
         return 0, 'Successfully installed SSL profile %s' % profile_id
 
     @host_service.method(
@@ -264,6 +305,7 @@ class SslProfile(host_service.HostModule):
             return 1, 'failed to delete profile %s: %s' % (profile_id, exc)
 
         _publish_ssl_profile_state(profile_id, False)
+        _notify_consumers(profile_id)
         return 0, 'Successfully deleted SSL profile %s' % profile_id
 
     @host_service.method(
@@ -324,6 +366,7 @@ class SslProfile(host_service.HostModule):
             return 1, 'failed to restore checkpoint: %s' % exc
 
         _publish_ssl_profile_state(profile_id, _dest_installed(profile_id))
+        _notify_consumers(profile_id)
         return 0, 'Successfully restored checkpoint'
 
     @host_service.method(
