@@ -14,7 +14,6 @@ import jinja2
 import psutil
 import time
 import json
-import threading
 from shutil import copy2
 from datetime import datetime
 from sonic_py_common import device_info
@@ -2164,9 +2163,10 @@ class RSyslogCfg(object):
 
     After regenerating rsyslog.conf, writes STATE_DB SYSLOG_SERVER|<addr>
     applied_transport_security / failure_reason so operators can see whether
-    a TLS row actually got an ossl omfwd action. Certz Finalize publishes
-    STATE_DB SSL_PROFILE|<id>; hostcfgd restarts rsyslog-config when a syslog
-    row uses that id.
+    a TLS row actually got an ossl omfwd action. Certz Finalize copies PEMs
+    via ssl_profile and restarts rsyslog-config when a SYSLOG_SERVER row
+    uses that tls_profile_id; rsyslog-config.sh also writes the same STATE_DB
+    fields after render.
     """
 
     SSL_CERTS_DIR = '/etc/sonic/ssl-certs'
@@ -2291,26 +2291,6 @@ class RSyslogCfg(object):
         # Updating the cache
         self.cache['config'] = rsyslog_config
         self.cache['servers'] = rsyslog_servers
-
-    def force_reload(self):
-        """Restart rsyslog-config so Jinja re-scans /etc/sonic/ssl-certs.
-
-        Used when host PEMs appear or disappear (Certz Finalize / Delete)
-        without a CONFIG_DB SYSLOG_SERVER change.
-        """
-        servers = self.cache.get('servers') or {}
-        apply_ok = True
-        try:
-            run_cmd(['systemctl', 'reset-failed', 'rsyslog-config',
-                     'rsyslog'], log_err=True, raise_exception=True)
-            run_cmd(['systemctl', 'restart', 'rsyslog-config'],
-                    log_err=True, raise_exception=True)
-        except Exception:
-            syslog.syslog(syslog.LOG_ERR,
-                          'RSyslogCfg: Failed to restart rsyslog service')
-            apply_ok = False
-        self._publish_tls_apply_state(servers, apply_ok=apply_ok)
-        return apply_ok
 
 
 class DnsCfg:
@@ -2997,49 +2977,6 @@ class HostConfigDaemon:
         syslog.syslog(syslog.LOG_INFO, 'SYSLOG_CONFIG table handler...')
         self.rsyslog_handler()
 
-    def ssl_profile_handler(self, key, op, data):
-        """Reload rsyslog when Certz host PEMs appear for a syslog TLS row."""
-        syslog.syslog(syslog.LOG_INFO,
-                      f'SSL_PROFILE handler... key={key} op={op}')
-        profile_id = key
-        rsyslog_servers = self.config_db.get_table(
-            swsscommon.CFG_SYSLOG_SERVER_TABLE_NAME) or {}
-        used = False
-        for row in rsyslog_servers.values():
-            if isinstance(row, dict) and row.get('tls_profile_id') == profile_id:
-                used = True
-                break
-        if not used:
-            return
-        rsyslog_config = self.config_db.get_table(
-            swsscommon.CFG_SYSLOG_CONFIG_TABLE_NAME) or {}
-        self.rsyslogcfg.cache['config'] = rsyslog_config
-        self.rsyslogcfg.cache['servers'] = rsyslog_servers
-        self.rsyslogcfg.force_reload()
-
-    def _ssl_profile_watch(self):
-        """STATE_DB SSL_PROFILE subscriber; runs in a daemon thread."""
-        try:
-            sel = swsscommon.Select()
-            sst = swsscommon.SubscriberStateTable(self.state_db_conn,
-                                                  'SSL_PROFILE')
-            sel.addSelectable(sst)
-        except Exception as err:
-            syslog.syslog(syslog.LOG_ERR,
-                          f'HostConfigDaemon: SSL_PROFILE watch init failed: {err}')
-            return
-        while True:
-            try:
-                state, _ = sel.select(1000)
-                if state != swsscommon.Select.OBJECT:
-                    continue
-                key, op, fvs = sst.pop()
-                data = dict(fvs) if fvs else {}
-                self.ssl_profile_handler(key, op, data)
-            except Exception as err:
-                syslog.syslog(syslog.LOG_ERR,
-                              f'HostConfigDaemon: SSL_PROFILE watch: {err}')
-
     def dns_nameserver_handler(self, key, op, data):
         syslog.syslog(syslog.LOG_INFO, 'DNS nameserver handler...')
         self.dnscfg.dns_update(key, data)
@@ -3143,9 +3080,6 @@ class HostConfigDaemon:
                                  make_callback(self.logging_handler))
 
     def start(self):
-        watch = threading.Thread(target=self._ssl_profile_watch,
-                                 name='ssl-profile-watch', daemon=True)
-        watch.start()
         self.config_db.listen(init_data_handler=self.load)
 
 def main():
