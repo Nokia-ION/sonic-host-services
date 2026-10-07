@@ -188,6 +188,109 @@ class TestHostcfgdTACACS(TestCase):
         self.assertNotIn("source_ip=10.9.9.9", pam_conf,
                          "source address survived an unusable source interface:\n" + pam_conf)
 
+    def source_interface_dual_stack(self, servers, test_name, loopback=None):
+        config = copy.deepcopy(dict(HOSTCFGD_TEST_TACACS_VECTOR)['TACACS']['config_db_tacacs'])
+        config['AAA']['authentication']['login'] = 'tacacs+'
+        config['TACPLUS']['global']['src_intf'] = 'Loopback0'
+        config['TACPLUS_SERVER'] = servers
+        config['LOOPBACK_INTERFACE'] = loopback if loopback is not None else {
+            'Loopback0|10.1.0.1/32': {},
+            'Loopback0|fc00:1::1/128': {},
+        }
+
+        op_path = output_path + "/" + test_name
+        sop_path = sample_output_path + "/TACACS_config_db_tacacs"
+        host_config_daemon = self.mock_hostcfgd({'src_intf': config}, 'src_intf', op_path, sop_path)
+
+        self.render_config_file(host_config_daemon)
+
+        with open(hostcfgd.NSS_TACPLUS_CONF) as f:
+            nss_conf = f.read()
+        with open(hostcfgd.PAM_AUTH_CONF) as f:
+            pam_lines = [l for l in f.read().splitlines() if 'pam_tacplus.so' in l]
+        return nss_conf, pam_lines
+
+    def test_hostcfgd_tacacs_source_interface_ipv6(self):
+        """
+            Test that IPv6 TACACS+ servers are sourced from the IPv6 address of
+            the source interface.
+
+            A source address of the other family cannot be bound to the
+            connection, so a server reached over IPv6 has to be given the
+            interface's IPv6 address.
+
+            Returns:
+                None
+        """
+        servers = {
+            'fc00:2::1': {'priority': 5, 'tcp_port': 49, 'timeout': 10,
+                          'auth_type': 'chap', 'passkey': 'dellsonic'},
+        }
+        nss_conf, pam_lines = self.source_interface_dual_stack(servers, "TACACS_source_interface_ipv6")
+
+        self.assertIn("src_ip=fc00:1::1", nss_conf,
+                      "IPv6 source address not used in tacplus_nss.conf:\n" + nss_conf)
+        self.assertEqual(len(pam_lines), 1, pam_lines)
+        self.assertIn("source_ip=fc00:1::1 ", pam_lines[0])
+
+    def test_hostcfgd_tacacs_source_interface_mixed_families(self):
+        """
+            Test that each TACACS+ server is sourced from the address of its
+            own family.
+
+            PAM takes a source address per server, so each gets the matching
+            one. NSS takes one for all servers, so it gets the one of the
+            highest priority server.
+
+            Returns:
+                None
+        """
+        servers = {
+            '192.168.1.1': {'priority': 2, 'tcp_port': 49, 'timeout': 10,
+                            'auth_type': 'chap', 'passkey': 'dellsonic'},
+            'fc00:2::1': {'priority': 5, 'tcp_port': 49, 'timeout': 10,
+                          'auth_type': 'chap', 'passkey': 'dellsonic'},
+        }
+        with mock.patch('hostcfgd.syslog.syslog') as mocked_syslog:
+            nss_conf, pam_lines = self.source_interface_dual_stack(
+                servers, "TACACS_source_interface_mixed_families")
+            self.assertTrue(any('both address families' in str(c) for c in mocked_syslog.call_args_list),
+                            mocked_syslog.call_args_list)
+
+        self.assertIn("src_ip=fc00:1::1", nss_conf,
+                      "NSS not sourced from the highest priority server's family:\n" + nss_conf)
+        self.assertEqual(len(pam_lines), 2, pam_lines)
+        v6_line = next(l for l in pam_lines if 'server=[fc00:2::1]' in l or 'server=fc00:2::1' in l)
+        v4_line = next(l for l in pam_lines if 'server=192.168.1.1' in l)
+        self.assertIn("source_ip=fc00:1::1 ", v6_line)
+        self.assertIn("source_ip=10.1.0.1 ", v4_line)
+
+    def test_hostcfgd_tacacs_source_interface_missing_family(self):
+        """
+            Test that a TACACS+ server of a family the source interface has no
+            address of is given no source address, and that NSS is still
+            sourced from the interface for the servers it can reach from it.
+
+            Returns:
+                None
+        """
+        servers = {
+            '192.168.1.1': {'priority': 2, 'tcp_port': 49, 'timeout': 10,
+                            'auth_type': 'chap', 'passkey': 'dellsonic'},
+            'fc00:2::1': {'priority': 5, 'tcp_port': 49, 'timeout': 10,
+                          'auth_type': 'chap', 'passkey': 'dellsonic'},
+        }
+        nss_conf, pam_lines = self.source_interface_dual_stack(
+            servers, "TACACS_source_interface_missing_family",
+            loopback={'Loopback0|10.1.0.1/32': {}})
+
+        self.assertIn("src_ip=10.1.0.1", nss_conf,
+                      "NSS not sourced from the interface for the server it can reach from it:\n" + nss_conf)
+        v6_line = next(l for l in pam_lines if 'server=fc00:2::1' in l)
+        v4_line = next(l for l in pam_lines if 'server=192.168.1.1' in l)
+        self.assertNotIn("source_ip=", v6_line)
+        self.assertIn("source_ip=10.1.0.1 ", v4_line)
+
     @parameterized.expand(HOSTCFGD_TEST_TACACS_VECTOR)
     def test_hostcfgd_tacacs(self, test_name, test_data):
         """
