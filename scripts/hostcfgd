@@ -830,6 +830,24 @@ class AaaCfg(object):
                 interface_ip = ipv4_addr
         return interface_ip
 
+    @staticmethod
+    def ip_family(addr):
+        try:
+            return ipaddress.ip_address(addr).version
+        except ValueError:
+            return None
+
+    def get_tacacs_source_ip(self, src_intf, server_addr):
+        """Return the address on src_intf of server_addr's family, or None.
+
+        A server given by name, or no server at all, gets the IPv4 address.
+        """
+        try:
+            addr = ipaddress.ip_address(server_addr) if server_addr else None
+        except ValueError:
+            addr = None
+        return self.get_interface_ip(src_intf, addr) or None
+
 
     def check_file_not_empty(self, filename):
         exists = os.path.exists(filename)
@@ -879,18 +897,15 @@ class AaaCfg(object):
         # the PAM and NSS configurations take is an address, so resolve it
         # here. src_intf wins over src_ip, which is how RADIUS treats the pair.
         src_intf = tacplus_global.get('src_intf')
-        if src_intf:
-            if src_ip:
-                syslog.syslog(syslog.LOG_INFO,
+        if src_intf and src_ip:
+            syslog.syslog(syslog.LOG_INFO,
         "TACPLUS|global: src_intf found. Ignoring src_ip")
-            # An interface that resolves to nothing leaves the client with no
-            # source address rather than with the one src_intf replaced.
-            src_ip = self.get_interface_ip(src_intf)
-            if not src_ip:
-                src_ip = None
-                syslog.syslog(syslog.LOG_WARNING,
-        "TACPLUS|global: src_intf {} has no usable IP addr.".format(src_intf))
 
+        # An interface carries an address of each family, and a source address
+        # of the wrong family cannot be bound to the connection, so each server
+        # is given the one matching its own address. An interface that resolves
+        # to nothing leaves the client with no source address rather than with
+        # the one src_intf replaced.
         servers_conf = []
         if self.tacplus_servers:
             for addr in self.tacplus_servers:
@@ -901,8 +916,33 @@ class AaaCfg(object):
                         server, TACPLUS_CONFIG_TOKEN_FIELDS, token_delimiters=','):
                     syslog.syslog(syslog.LOG_ERR, "TACPLUS_SERVER: invalid field; ignoring entry")
                     continue
+                if src_intf:
+                    server['source_ip'] = self.get_tacacs_source_ip(src_intf, addr)
+                    if not server['source_ip']:
+                        syslog.syslog(syslog.LOG_WARNING,
+        "TACPLUS_SERVER|{}: src_intf {} has no usable IPv{} addr.".format(
+            addr, src_intf, self.ip_family(addr) or 4))
+                else:
+                    server['source_ip'] = src_ip
                 servers_conf.append(server)
             servers_conf = sorted(servers_conf, key=lambda t: int(t['priority']), reverse=True)
+
+        # libnss-tacplus takes a single source address for every server. Give it
+        # the one PAM uses for the highest priority server that has one, which
+        # is the first server it can reach from the source interface; a server
+        # of the other family fails to bind and is passed over straight away.
+        if src_intf:
+            if servers_conf:
+                src_ip = next((s['source_ip'] for s in servers_conf if s['source_ip']), None)
+                families = {self.ip_family(s['ip']) or 4 for s in servers_conf}
+                if len(families) > 1:
+                    syslog.syslog(syslog.LOG_WARNING,
+        "TACPLUS|global: servers of both address families; NSS sources from {} for all of them".format(src_ip))
+            else:
+                src_ip = self.get_tacacs_source_ip(src_intf, None)
+                if not src_ip:
+                    syslog.syslog(syslog.LOG_WARNING,
+        "TACPLUS|global: src_intf {} has no usable IP addr.".format(src_intf))
 
         self.update_tacacs_dscp(servers_conf, tacplus_global.get('dscp'))
 
@@ -972,7 +1012,7 @@ class AaaCfg(object):
         if 'radius' in authentication['login']:
             pam_conf = template.render(debug=self.debug, trace=self.trace, auth=authentication, servers=radsrvs_conf)
         else:
-            pam_conf = template.render(auth=authentication, src_ip=src_ip, servers=servers_conf)
+            pam_conf = template.render(auth=authentication, servers=servers_conf)
 
         # Use rename(), which is atomic (on the same fs) to avoid empty file
         with open(PAM_AUTH_CONF + ".tmp", 'w') as f:
