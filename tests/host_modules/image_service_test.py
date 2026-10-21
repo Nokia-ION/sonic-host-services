@@ -1,5 +1,8 @@
 import hashlib
+import io
 import subprocess
+import os
+import tarfile
 import pytest
 import json
 import errno
@@ -490,10 +493,15 @@ class TestImageService(object):
         assert rc == 2, "wrong return value"
         assert "permission denied" in msg
 
+    INSTALLED_IMAGES_LIST = (
+        b"Current: SONiC-OS-running\nNext: SONiC-OS-running\nAvailable:\nSONiC-OS-running\nSONiC-OS-other\n"
+    )
+
+    @mock.patch("subprocess.check_output", return_value=INSTALLED_IMAGES_LIST)
     @mock.patch("dbus.SystemBus")
     @mock.patch("dbus.service.BusName")
     @mock.patch("dbus.service.Object.__init__")
-    def test_gnoi_install_os_transfer_request(self, MockInit, MockBusName, MockSystemBus):
+    def test_gnoi_install_os_transfer_request(self, MockInit, MockBusName, MockSystemBus, mock_check_output):
         """
         TransferRequest with a version should return TransferReady and remember
         the version for the subsequent TransferEnd.
@@ -506,11 +514,17 @@ class TestImageService(object):
         assert rc == 0
         assert json.loads(response) == {"transferReady": {}}
         assert image_service._gnoi_install_version == "SONiC.1.0.0"
+        mock_check_output.assert_called_once_with(
+            ["/usr/local/bin/sonic-installer", "list"], stderr=subprocess.STDOUT
+        )
 
+    @mock.patch("subprocess.check_output", return_value=INSTALLED_IMAGES_LIST)
     @mock.patch("dbus.SystemBus")
     @mock.patch("dbus.service.BusName")
     @mock.patch("dbus.service.Object.__init__")
-    def test_gnoi_install_os_transfer_request_string_input(self, MockInit, MockBusName, MockSystemBus):
+    def test_gnoi_install_os_transfer_request_string_input(
+        self, MockInit, MockBusName, MockSystemBus, mock_check_output
+    ):
         """
         On real hardware the D-Bus arg arrives as a single string (not a list);
         it must be used as-is and not mangled character-by-character.
@@ -523,6 +537,49 @@ class TestImageService(object):
         assert rc == 0
         assert json.loads(response) == {"transferReady": {}}
         assert image_service._gnoi_install_version == "SONiC.1.0.0"
+
+    @pytest.mark.parametrize("version", ["SONiC-OS-running", "SONiC-OS-other"])
+    @mock.patch("subprocess.check_output", return_value=INSTALLED_IMAGES_LIST)
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_install_os_transfer_request_already_installed(
+        self, MockInit, MockBusName, MockSystemBus, mock_check_output, version
+    ):
+        """
+        TransferRequest for an installed version should return Validated so the
+        image is not transferred again.
+        """
+        image_service = ImageService(mod_name="image_service")
+        image_service._gnoi_install_version = "stale"
+        options = ['{"transferRequest": {"version": "%s"}}' % version]
+
+        rc, response = image_service.gnoi_install_os(options)
+
+        assert rc == 0
+        assert json.loads(response) == {"validated": {"version": version}}
+        assert image_service._gnoi_install_version == ""
+
+    @mock.patch(
+        "subprocess.check_output",
+        side_effect=subprocess.CalledProcessError(1, "sonic-installer list", output=b""),
+    )
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_install_os_transfer_request_list_fails(
+        self, MockInit, MockBusName, MockSystemBus, mock_check_output
+    ):
+        """
+        If the installed images cannot be listed, the image is transferred.
+        """
+        image_service = ImageService(mod_name="image_service")
+
+        rc, response = image_service.gnoi_install_os(['{"transferRequest": {"version": "SONiC-OS-running"}}'])
+
+        assert rc == 0
+        assert json.loads(response) == {"transferReady": {}}
+        assert image_service._gnoi_install_version == "SONiC-OS-running"
 
     @mock.patch("dbus.SystemBus")
     @mock.patch("dbus.service.BusName")
@@ -540,6 +597,7 @@ class TestImageService(object):
         resp = json.loads(response)
         assert resp["installError"]["type"] == "PARSE_FAIL"
 
+    @mock.patch("host_modules.image_service.ImageService._gnoi_check_install_image", return_value=None)
     @mock.patch("subprocess.run")
     @mock.patch("os.remove")
     @mock.patch("os.path.isfile", return_value=True)
@@ -547,7 +605,7 @@ class TestImageService(object):
     @mock.patch("dbus.service.BusName")
     @mock.patch("dbus.service.Object.__init__")
     def test_gnoi_install_os_transfer_end_success(
-        self, MockInit, MockBusName, MockSystemBus, mock_isfile, mock_remove, mock_run
+        self, MockInit, MockBusName, MockSystemBus, mock_isfile, mock_remove, mock_run, mock_check
     ):
         """
         TransferEnd should install the staged image and return Validated.
@@ -564,6 +622,7 @@ class TestImageService(object):
 
         assert rc == 0
         assert json.loads(response) == {"validated": {"version": "SONiC.1.0.0"}}
+        mock_check.assert_called_once_with("/var/tmp/SONiC.1.0.0")
         mock_run.assert_called_once_with(
             ["/usr/local/bin/sonic-installer", "install", "-y", "/var/tmp/SONiC.1.0.0"],
             stdout=subprocess.PIPE,
@@ -572,6 +631,20 @@ class TestImageService(object):
         # pending version is cleared after install
         assert image_service._gnoi_install_version == ""
 
+    @pytest.mark.parametrize(
+        "stdout, stderr, expected_type",
+        [
+            (b"", b"Image file does not exist or is not a valid SONiC image file\nAborted!", "PARSE_FAIL"),
+            (b"", b"Image file 'x' is of a different platform ASIC type than running platform's.\nAborted!",
+             "INCOMPATIBLE"),
+            (b"", b"Image file 'x' is of a different type than running image.\nAborted!", "INCOMPATIBLE"),
+            (b"", b"Insufficient free disk space to install the image. Aborting...\nAborted!", "TOO_LARGE"),
+            (b"Verifying image checksum ...\nERROR: Unable to verify archive checksum\n", b"", "INTEGRITY_FAIL"),
+            (b"", b"Error: Failed verify image signature\nAborted!", "INTEGRITY_FAIL"),
+            (b"", b"Error: bad image", "UNSPECIFIED"),
+        ],
+    )
+    @mock.patch("host_modules.image_service.ImageService._gnoi_check_install_image", return_value=None)
     @mock.patch("subprocess.run")
     @mock.patch("os.remove")
     @mock.patch("os.path.isfile", return_value=True)
@@ -579,26 +652,167 @@ class TestImageService(object):
     @mock.patch("dbus.service.BusName")
     @mock.patch("dbus.service.Object.__init__")
     def test_gnoi_install_os_transfer_end_install_failure(
-        self, MockInit, MockBusName, MockSystemBus, mock_isfile, mock_remove, mock_run
+        self, MockInit, MockBusName, MockSystemBus, mock_isfile, mock_remove, mock_run, mock_check,
+        stdout, stderr, expected_type
     ):
         """
-        A sonic-installer failure on TransferEnd should return a typed
-        INSTALL_RUN_PACKAGE InstallError (rc=0 so the front-end sees the typed error).
+        A sonic-installer failure on TransferEnd should return an InstallError typed from the
+        installer output (rc=0 so the front-end sees the typed error).
         """
         image_service = ImageService(mod_name="image_service")
         image_service._gnoi_install_version = "SONiC.bad"
         mock_result = mock.Mock()
         mock_result.returncode = 1
-        mock_result.stdout = b""
-        mock_result.stderr = b"Error: bad image"
+        mock_result.stdout = stdout
+        mock_result.stderr = stderr
         mock_run.return_value = mock_result
 
         rc, response = image_service.gnoi_install_os(['{"transferEnd": {}}'])
 
         assert rc == 0
         resp = json.loads(response)
-        assert resp["installError"]["type"] == "INSTALL_RUN_PACKAGE"
-        assert "bad image" in resp["installError"]["detail"]
+        assert resp["installError"]["type"] == expected_type
+        assert resp["installError"]["detail"] == (stderr or stdout).decode().strip()
+        mock_remove.assert_called_once_with("/var/tmp/SONiC.bad")
+        assert image_service._gnoi_install_version == ""
+
+    @mock.patch(
+        "host_modules.image_service.ImageService._gnoi_check_install_image",
+        return_value=("INCOMPATIBLE", "Image SONiC.x does not support platform p"),
+    )
+    @mock.patch("subprocess.run")
+    @mock.patch("os.remove")
+    @mock.patch("os.path.isfile", return_value=True)
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_install_os_transfer_end_rejected_before_install(
+        self, MockInit, MockBusName, MockSystemBus, mock_isfile, mock_remove, mock_run, mock_check
+    ):
+        """
+        An image rejected by the pre-install checks is not handed to sonic-installer install.
+        """
+        image_service = ImageService(mod_name="image_service")
+        image_service._gnoi_install_version = "SONiC.x"
+
+        rc, response = image_service.gnoi_install_os(['{"transferEnd": {}}'])
+
+        assert rc == 0
+        assert json.loads(response) == {
+            "installError": {"type": "INCOMPATIBLE", "detail": "Image SONiC.x does not support platform p"}
+        }
+        mock_run.assert_not_called()
+        mock_remove.assert_called_once_with("/var/tmp/SONiC.x")
+        assert image_service._gnoi_install_version == ""
+
+    @pytest.mark.parametrize(
+        "binary_version_rc, binary_version_out, platforms, expected",
+        [
+            (1, b"Image file does not exist or is not a valid SONiC image file\n", None, "PARSE_FAIL"),
+            (0, b"\n", None, "PARSE_FAIL"),
+            (0, b"SONiC-OS-running\n", None, "INSTALL_RUN_PACKAGE"),
+            (0, b"SONiC-OS-new\n", {"x86_64-other-r0"}, "INCOMPATIBLE"),
+            (0, b"SONiC-OS-new\n", {"x86_64-other-r0", "arm64-this-r0"}, None),
+            (0, b"SONiC-OS-new\n", None, None),
+        ],
+    )
+    @mock.patch("host_modules.image_service.device_info.get_platform", return_value="arm64-this-r0")
+    @mock.patch("host_modules.image_service.ImageService._read_image_platforms")
+    @mock.patch("subprocess.check_output")
+    @mock.patch("subprocess.run")
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_check_install_image(
+        self, MockInit, MockBusName, MockSystemBus, mock_run, mock_check_output, mock_read_platforms,
+        mock_get_platform, binary_version_rc, binary_version_out, platforms, expected
+    ):
+        """
+        The pre-install checks map an unreadable image to PARSE_FAIL, the running version to
+        INSTALL_RUN_PACKAGE and an image without the running platform to INCOMPATIBLE.
+        """
+        image_service = ImageService(mod_name="image_service")
+        mock_run.return_value = mock.Mock(returncode=binary_version_rc, stdout=binary_version_out, stderr=b"")
+        mock_check_output.return_value = (
+            b"Current: SONiC-OS-running\nNext: SONiC-OS-running\nAvailable:\nSONiC-OS-running\n"
+        )
+        mock_read_platforms.return_value = platforms
+
+        result = image_service._gnoi_check_install_image("/var/tmp/image")
+
+        assert (result[0] if result else None) == expected
+        mock_run.assert_called_once_with(
+            ["/usr/local/bin/sonic-installer", "binary-version", "/var/tmp/image"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    @mock.patch("host_modules.image_service.device_info.get_platform", return_value="arm64-this-r0")
+    @mock.patch("host_modules.image_service.ImageService._read_image_platforms", return_value=None)
+    @mock.patch("subprocess.check_output")
+    @mock.patch("subprocess.run")
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_check_install_image_list_fails(
+        self, MockInit, MockBusName, MockSystemBus, mock_run, mock_check_output, mock_read_platforms,
+        mock_get_platform
+    ):
+        """
+        Failing to read the running image does not block the install.
+        """
+        image_service = ImageService(mod_name="image_service")
+        mock_run.return_value = mock.Mock(returncode=0, stdout=b"SONiC-OS-new\n", stderr=b"")
+        mock_check_output.side_effect = subprocess.CalledProcessError(1, "sonic-installer list", output=b"")
+
+        assert image_service._gnoi_check_install_image("/var/tmp/image") is None
+
+    @staticmethod
+    def _make_image(path, header=b"#!/bin/sh\necho installer\nexit 0\nexit_marker\n", platforms=None):
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w") as tar:
+            for name, data in [("installer/install.sh", b"echo install\n")] + (
+                [("installer/platforms_asic", platforms)] if platforms is not None else []
+            ):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        with open(path, "wb") as f:
+            f.write(header + payload.getvalue())
+
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_read_image_platforms(self, MockInit, MockBusName, MockSystemBus, tmp_path):
+        """
+        The platform list is read from installer/platforms_asic in the image payload.
+        """
+        image_service = ImageService(mod_name="image_service")
+        image = str(tmp_path / "image.bin")
+        self._make_image(image, platforms=b"x86_64-a-r0\narm64-b-r0\n")
+
+        assert image_service._read_image_platforms(image) == {"x86_64-a-r0", "arm64-b-r0"}
+
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_read_image_platforms_without_list(self, MockInit, MockBusName, MockSystemBus, tmp_path):
+        """
+        Images without installer/platforms_asic, without a payload marker or with an unreadable
+        payload carry no platform list.
+        """
+        image_service = ImageService(mod_name="image_service")
+        no_list = str(tmp_path / "no_list.bin")
+        self._make_image(no_list)
+        no_marker = tmp_path / "no_marker.bin"
+        no_marker.write_bytes(os.urandom(4096))
+        bad_payload = tmp_path / "bad_payload.bin"
+        bad_payload.write_bytes(b"#!/bin/sh\nexit_marker\n" + b"\x00garbage" * 100)
+
+        assert image_service._read_image_platforms(no_list) is None
+        assert image_service._read_image_platforms(str(no_marker)) is None
+        assert image_service._read_image_platforms(str(bad_payload)) is None
+        assert image_service._read_image_platforms(str(tmp_path / "missing.bin")) is None
 
     @mock.patch("os.path.isfile", return_value=False)
     @mock.patch("dbus.SystemBus")

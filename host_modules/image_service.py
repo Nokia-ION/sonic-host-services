@@ -12,9 +12,11 @@ import logging
 import os
 import subprocess
 import json
+import tarfile
 
 from host_modules import host_service
 from host_modules.file_path_policy import DENIED, open_checksum_file
+from sonic_py_common import device_info
 
 MOD_NAME = "image_service"
 
@@ -25,6 +27,25 @@ MOD_NAME = "image_service"
 # rules/docker-gnmi.mk. On the host that same file is at /var/tmp/<version>.
 # This constant MUST stay in sync with the container's --img_dir flag.
 GNOI_OS_HOST_IMG_DIR = "/var/tmp"
+
+SONIC_INSTALLER = "/usr/local/bin/sonic-installer"
+
+# A SONiC ONIE image is a shell script followed by a tar payload that starts
+# after the "exit_marker" line; the payload lists the platforms the image
+# supports in installer/platforms_asic.
+IMAGE_PAYLOAD_MARKER = b"exit_marker"
+IMAGE_HEADER_MAX_SIZE = 1024 * 1024
+IMAGE_PLATFORMS_ASIC = "installer/platforms_asic"
+
+# sonic-installer install output that identifies a gNOI InstallError type.
+GNOI_INSTALL_ERROR_PATTERNS = [
+    ("not a valid SONiC image file", "PARSE_FAIL"),
+    ("different platform ASIC type", "INCOMPATIBLE"),
+    ("different type than running image", "INCOMPATIBLE"),
+    ("Insufficient free disk space", "TOO_LARGE"),
+    ("Unable to verify archive checksum", "INTEGRITY_FAIL"),
+    ("Failed verify image signature", "INTEGRITY_FAIL"),
+]
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +211,9 @@ class ImageService(host_service.HostModule):
         the streaming transfer and calls this method twice via D-Bus:
 
           1) TransferRequest phase -- input {"transferRequest": {"version": ...}}.
-             We validate the request and reply {"transferReady": {}} so the
+             If the version is already installed we reply
+             {"validated": {"version": ...}} and the transfer is skipped.
+             Otherwise we reply {"transferReady": {}} so the
              front-end starts streaming the image bytes into
              GNOI_OS_HOST_IMG_DIR/<version>. The raw image content is NOT sent
              to this backend; the front-end writes it to the shared img_dir.
@@ -241,6 +264,11 @@ class ImageService(host_service.HostModule):
                     {"installError": {"type": "PARSE_FAIL",
                                       "detail": "TransferRequest must contain a version"}}
                 )
+            images = self._gnoi_list_images()
+            if images is not None and version in images["available"]:
+                logger.info("gnoi_install_os: version=%s is already installed -> Validated", version)
+                self._gnoi_install_version = ""
+                return 0, json.dumps({"validated": {"version": version}})
             # Remember the version for the TransferEnd phase. The front-end
             # serializes Install RPCs with a mutex, so a single pending version
             # is sufficient.
@@ -267,9 +295,17 @@ class ImageService(host_service.HostModule):
                                       "detail": "Transferred image not found at {}".format(image_path)}}
                 )
 
-            logger.info("gnoi_install_os: installing image %s (version=%s)", image_path, version)
-            cmd = ["/usr/local/bin/sonic-installer", "install", "-y", image_path]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            install_error = self._gnoi_check_install_image(image_path)
+            if install_error is None:
+                logger.info("gnoi_install_os: installing image %s (version=%s)", image_path, version)
+                cmd = [SONIC_INSTALLER, "install", "-y", image_path]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if result.returncode != 0:
+                    stdout = result.stdout.decode(errors="replace").strip()
+                    stderr = result.stderr.decode(errors="replace").strip()
+                    detail = stderr or stdout or "sonic-installer install failed"
+                    logger.error("gnoi_install_os: install failed rc=%s: %s", result.returncode, detail)
+                    install_error = (self._gnoi_install_error_type(stdout + "\n" + stderr), detail)
 
             # Best-effort cleanup of the staged image regardless of outcome;
             # sonic-installer copies it into the image store on success.
@@ -279,13 +315,10 @@ class ImageService(host_service.HostModule):
                 pass
             self._gnoi_install_version = ""
 
-            if result.returncode != 0:
-                detail = (result.stderr.decode(errors="replace").strip()
-                          or result.stdout.decode(errors="replace").strip()
-                          or "sonic-installer install failed")
-                logger.error("gnoi_install_os: install failed rc=%s: %s", result.returncode, detail)
+            if install_error is not None:
+                error_type, detail = install_error
                 return 0, json.dumps(
-                    {"installError": {"type": "INSTALL_RUN_PACKAGE", "detail": detail}}
+                    {"installError": {"type": error_type, "detail": detail}}
                 )
 
             logger.info("gnoi_install_os: install complete for version=%s", version)
@@ -297,3 +330,73 @@ class ImageService(host_service.HostModule):
             {"installError": {"type": "PARSE_FAIL",
                               "detail": "Unsupported or unexpected InstallRequest message"}}
         )
+
+    def _gnoi_check_install_image(self, image_path):
+        """
+        Reject a staged image that sonic-installer would install anyway or
+        fail on without saying why.
+
+        Returns:
+            (InstallError type, detail) if the image must be rejected, else None.
+        """
+        result = subprocess.run(
+            [SONIC_INSTALLER, "binary-version", image_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        image_version = result.stdout.decode(errors="replace").strip() if result.returncode == 0 else ""
+        if not image_version:
+            return "PARSE_FAIL", "Unable to read the OS version from the transferred image; it is not a valid SONiC image"
+
+        images = self._gnoi_list_images()
+        if images is not None and image_version == images["current"]:
+            return "INSTALL_RUN_PACKAGE", "Image {} is the currently running OS version".format(image_version)
+
+        platforms = self._read_image_platforms(image_path)
+        platform = device_info.get_platform()
+        if platforms is not None and platform and platform not in platforms:
+            return "INCOMPATIBLE", "Image {} does not support platform {}".format(image_version, platform)
+        return None
+
+    def _gnoi_list_images(self):
+        """
+        Returns the parsed `sonic-installer list` output, or None if it cannot be read.
+        """
+        try:
+            output = subprocess.check_output([SONIC_INSTALLER, "list"], stderr=subprocess.STDOUT).decode().strip()
+        except (OSError, subprocess.CalledProcessError) as e:
+            logger.warning("gnoi_install_os: unable to list installed images: %s", e)
+            return None
+        return self._parse_sonic_installer_list(output)
+
+    def _read_image_platforms(self, image_path):
+        """
+        Returns the set of platforms listed in the image payload, or None if
+        the image does not carry the list.
+        """
+        try:
+            with open(image_path, "rb") as f:
+                header_size = 0
+                while header_size < IMAGE_HEADER_MAX_SIZE:
+                    line = f.readline(IMAGE_HEADER_MAX_SIZE)
+                    if not line:
+                        return None
+                    header_size += len(line)
+                    if line.rstrip(b"\n") == IMAGE_PAYLOAD_MARKER:
+                        break
+                else:
+                    return None
+                with tarfile.open(fileobj=f, mode="r|*") as tar:
+                    for member in tar:
+                        if member.name == IMAGE_PLATFORMS_ASIC:
+                            data = tar.extractfile(member).read().decode(errors="replace")
+                            return set(data.split())
+        except (OSError, tarfile.TarError) as e:
+            logger.warning("gnoi_install_os: unable to read %s from %s: %s", IMAGE_PLATFORMS_ASIC, image_path, e)
+        return None
+
+    def _gnoi_install_error_type(self, output):
+        """Map sonic-installer install output to a gNOI InstallError type."""
+        for pattern, error_type in GNOI_INSTALL_ERROR_PATTERNS:
+            if pattern in output:
+                return error_type
+        return "UNSPECIFIED"
