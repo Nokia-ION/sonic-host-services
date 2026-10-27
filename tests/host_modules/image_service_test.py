@@ -597,7 +597,14 @@ class TestImageService(object):
         resp = json.loads(response)
         assert resp["installError"]["type"] == "PARSE_FAIL"
 
-    @mock.patch("host_modules.image_service.ImageService._gnoi_check_install_image", return_value=None)
+    @pytest.mark.parametrize(
+        "requested, image_version",
+        [
+            ("SONiC.1.0.0", "SONiC.1.0.0"),
+            ("SONiC-OS-FOO", "SONiC-OS-HEAD.1761563-nokia-cpn-5e13a932"),
+        ],
+    )
+    @mock.patch("host_modules.image_service.ImageService._gnoi_check_install_image")
     @mock.patch("subprocess.run")
     @mock.patch("os.remove")
     @mock.patch("os.path.isfile", return_value=True)
@@ -605,13 +612,16 @@ class TestImageService(object):
     @mock.patch("dbus.service.BusName")
     @mock.patch("dbus.service.Object.__init__")
     def test_gnoi_install_os_transfer_end_success(
-        self, MockInit, MockBusName, MockSystemBus, mock_isfile, mock_remove, mock_run, mock_check
+        self, MockInit, MockBusName, MockSystemBus, mock_isfile, mock_remove, mock_run, mock_check,
+        requested, image_version
     ):
         """
-        TransferEnd should install the staged image and return Validated.
+        TransferEnd should install the staged image and return Validated with the
+        version the image holds, whatever version the client transferred it as.
         """
         image_service = ImageService(mod_name="image_service")
-        image_service._gnoi_install_version = "SONiC.1.0.0"
+        image_service._gnoi_install_version = requested
+        mock_check.return_value = (image_version, None)
         mock_result = mock.Mock()
         mock_result.returncode = 0
         mock_result.stdout = b""
@@ -621,10 +631,10 @@ class TestImageService(object):
         rc, response = image_service.gnoi_install_os(['{"transferEnd": {}}'])
 
         assert rc == 0
-        assert json.loads(response) == {"validated": {"version": "SONiC.1.0.0"}}
-        mock_check.assert_called_once_with("/var/tmp/SONiC.1.0.0")
+        assert json.loads(response) == {"validated": {"version": image_version}}
+        mock_check.assert_called_once_with("/var/tmp/" + requested)
         mock_run.assert_called_once_with(
-            ["/usr/local/bin/sonic-installer", "install", "-y", "/var/tmp/SONiC.1.0.0"],
+            ["/usr/local/bin/sonic-installer", "install", "-y", "/var/tmp/" + requested],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -644,7 +654,8 @@ class TestImageService(object):
             (b"", b"Error: bad image", "UNSPECIFIED"),
         ],
     )
-    @mock.patch("host_modules.image_service.ImageService._gnoi_check_install_image", return_value=None)
+    @mock.patch("host_modules.image_service.ImageService._gnoi_check_install_image",
+                return_value=("SONiC.bad", None))
     @mock.patch("subprocess.run")
     @mock.patch("os.remove")
     @mock.patch("os.path.isfile", return_value=True)
@@ -678,7 +689,7 @@ class TestImageService(object):
 
     @mock.patch(
         "host_modules.image_service.ImageService._gnoi_check_install_image",
-        return_value=("INCOMPATIBLE", "Image SONiC.x does not support platform p"),
+        return_value=("SONiC.x", ("INCOMPATIBLE", "Image SONiC.x does not support platform p")),
     )
     @mock.patch("subprocess.run")
     @mock.patch("os.remove")
@@ -738,9 +749,10 @@ class TestImageService(object):
         )
         mock_read_platforms.return_value = platforms
 
-        result = image_service._gnoi_check_install_image("/var/tmp/image")
+        version, error = image_service._gnoi_check_install_image("/var/tmp/image")
 
-        assert (result[0] if result else None) == expected
+        assert (error[0] if error else None) == expected
+        assert version == (binary_version_out.decode().strip() if binary_version_rc == 0 else "")
         mock_run.assert_called_once_with(
             ["/usr/local/bin/sonic-installer", "binary-version", "/var/tmp/image"],
             stdout=subprocess.PIPE,
@@ -765,7 +777,7 @@ class TestImageService(object):
         mock_run.return_value = mock.Mock(returncode=0, stdout=b"SONiC-OS-new\n", stderr=b"")
         mock_check_output.side_effect = subprocess.CalledProcessError(1, "sonic-installer list", output=b"")
 
-        assert image_service._gnoi_check_install_image("/var/tmp/image") is None
+        assert image_service._gnoi_check_install_image("/var/tmp/image") == ("SONiC-OS-new", None)
 
     @staticmethod
     def _make_image(path, header=b"#!/bin/sh\necho installer\nexit 0\nexit_marker\n", platforms=None):

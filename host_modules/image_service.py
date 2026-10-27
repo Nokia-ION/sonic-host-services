@@ -295,7 +295,10 @@ class ImageService(host_service.HostModule):
                                       "detail": "Transferred image not found at {}".format(image_path)}}
                 )
 
-            install_error = self._gnoi_check_install_image(image_path)
+            image_version, install_error = self._gnoi_check_install_image(image_path)
+            if install_error is None and image_version != version:
+                logger.warning("gnoi_install_os: image transferred as %s holds version %s",
+                               version, image_version)
             if install_error is None:
                 logger.info("gnoi_install_os: installing image %s (version=%s)", image_path, version)
                 cmd = [SONIC_INSTALLER, "install", "-y", image_path]
@@ -321,8 +324,10 @@ class ImageService(host_service.HostModule):
                     {"installError": {"type": error_type, "detail": detail}}
                 )
 
-            logger.info("gnoi_install_os: install complete for version=%s", version)
-            return 0, json.dumps({"validated": {"version": version}})
+            # Validated.version is the version the package holds, not the one the
+            # client asked for, so that a client can tell when the two differ.
+            logger.info("gnoi_install_os: install complete for version=%s", image_version)
+            return 0, json.dumps({"validated": {"version": image_version}})
 
         # --- Anything else ---------------------------------------------------
         logger.error("gnoi_install_os: unsupported InstallRequest type: %s", request_str)
@@ -337,7 +342,9 @@ class ImageService(host_service.HostModule):
         fail on without saying why.
 
         Returns:
-            (InstallError type, detail) if the image must be rejected, else None.
+            (image version, error): the OS version read from the image, "" if
+            it cannot be read, and (InstallError type, detail) if the image
+            must be rejected, else None.
         """
         result = subprocess.run(
             [SONIC_INSTALLER, "binary-version", image_path],
@@ -345,17 +352,20 @@ class ImageService(host_service.HostModule):
         )
         image_version = result.stdout.decode(errors="replace").strip() if result.returncode == 0 else ""
         if not image_version:
-            return "PARSE_FAIL", "Unable to read the OS version from the transferred image; it is not a valid SONiC image"
+            return "", ("PARSE_FAIL",
+                        "Unable to read the OS version from the transferred image; it is not a valid SONiC image")
 
         images = self._gnoi_list_images()
         if images is not None and image_version == images["current"]:
-            return "INSTALL_RUN_PACKAGE", "Image {} is the currently running OS version".format(image_version)
+            return image_version, ("INSTALL_RUN_PACKAGE",
+                                   "Image {} is the currently running OS version".format(image_version))
 
         platforms = self._read_image_platforms(image_path)
         platform = device_info.get_platform()
         if platforms is not None and platform and platform not in platforms:
-            return "INCOMPATIBLE", "Image {} does not support platform {}".format(image_version, platform)
-        return None
+            return image_version, ("INCOMPATIBLE",
+                                   "Image {} does not support platform {}".format(image_version, platform))
+        return image_version, None
 
     def _gnoi_list_images(self):
         """
