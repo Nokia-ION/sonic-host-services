@@ -598,6 +598,42 @@ class TestImageService(object):
         assert resp["installError"]["type"] == "PARSE_FAIL"
 
     @pytest.mark.parametrize(
+        "version",
+        ["../../etc/shadow", "/etc/shadow", "sub/SONiC.1.0.0", ".", "..", "SONiC\u0000.bin", 5, ["SONiC.1.0.0"]],
+    )
+    @mock.patch("os.remove")
+    @mock.patch("subprocess.run")
+    @mock.patch("subprocess.check_output")
+    @mock.patch("dbus.SystemBus")
+    @mock.patch("dbus.service.BusName")
+    @mock.patch("dbus.service.Object.__init__")
+    def test_gnoi_install_os_transfer_request_unsafe_version(
+        self, MockInit, MockBusName, MockSystemBus, mock_check_output, mock_run, mock_remove, version
+    ):
+        """
+        A version that could name a file outside GNOI_OS_HOST_IMG_DIR is rejected
+        with PARSE_FAIL, and clears any pending version so TransferEnd never
+        installs or removes a file for it.
+        """
+        image_service = ImageService(mod_name="image_service")
+        image_service._gnoi_install_version = "SONiC.pending"
+
+        rc, response = image_service.gnoi_install_os(
+            [json.dumps({"transferRequest": {"version": version}})])
+
+        assert rc == 0
+        assert json.loads(response)["installError"]["type"] == "PARSE_FAIL"
+        assert image_service._gnoi_install_version == ""
+        mock_check_output.assert_not_called()
+
+        rc, response = image_service.gnoi_install_os(['{"transferEnd": {}}'])
+
+        assert rc == 0
+        assert json.loads(response)["installError"]["type"] == "UNSPECIFIED"
+        mock_run.assert_not_called()
+        mock_remove.assert_not_called()
+
+    @pytest.mark.parametrize(
         "requested, image_version",
         [
             ("SONiC.1.0.0", "SONiC.1.0.0"),
