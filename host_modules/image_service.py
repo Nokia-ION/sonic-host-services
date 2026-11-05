@@ -264,6 +264,13 @@ class ImageService(host_service.HostModule):
                     {"installError": {"type": "PARSE_FAIL",
                                       "detail": "TransferRequest must contain a version"}}
                 )
+            if not self._gnoi_is_safe_version(version):
+                logger.error("gnoi_install_os: TransferRequest version %r is not a plain file name", version)
+                self._gnoi_install_version = ""
+                return 0, json.dumps(
+                    {"installError": {"type": "PARSE_FAIL",
+                                      "detail": "TransferRequest version must be a plain file name"}}
+                )
             images = self._gnoi_list_images()
             if images is not None and version in images["available"]:
                 logger.info("gnoi_install_os: version=%s is already installed -> Validated", version)
@@ -335,6 +342,20 @@ class ImageService(host_service.HostModule):
             {"installError": {"type": "PARSE_FAIL",
                               "detail": "Unsupported or unexpected InstallRequest message"}}
         )
+
+    @staticmethod
+    def _gnoi_is_safe_version(version):
+        """
+        Return True if the version can name a file directly in GNOI_OS_HOST_IMG_DIR.
+
+        The version is joined onto GNOI_OS_HOST_IMG_DIR to locate, install and
+        then delete the staged image, so it must not be able to name anything
+        outside that directory.
+        """
+        return (isinstance(version, str)
+                and version not in (".", "..")
+                and "/" not in version
+                and "\0" not in version)
 
     def _gnoi_check_install_image(self, image_path):
         """
