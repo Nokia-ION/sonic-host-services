@@ -79,6 +79,23 @@ HOSTCFGD_TEST_RSYSLOG_VECTOR = {
             '10.0.0.5': {
                 'protocol': 'tls',
                 'tls_profile_id': 'siem-east',
+                'tls_permitted_peers': 'syslog.example.com',
+                'port': '6514'
+            }
+        },
+    },
+    'add_tls_server_no_peers': {
+        'SYSLOG_SERVER': {
+            '1.1.1.1': {
+                'port': 'tcp',
+                'vrf': 'mgmt',
+                'filter': 'include',
+                'filter_regex': '^dsfdsdf$',
+                'severity': 'info'
+            },
+            '10.0.0.5': {
+                'protocol': 'tls',
+                'tls_profile_id': 'siem-east',
                 'port': '6514'
             }
         },
