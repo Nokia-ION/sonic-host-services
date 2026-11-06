@@ -134,6 +134,18 @@ class TestHostcfgdRSyslog(TestCase):
                           'applied_transport_security') == 'true'
         assert state.hget('SYSLOG_SERVER|10.0.0.5', 'failure_reason') == 'NONE'
 
+    def test_rsyslog_tls_without_peers_sets_no_permitted_peers(self):
+        # PEMs are present, but rsyslog-config skips a TLS row with no peers,
+        # so hostcfgd must not report it as applied.
+        with mock.patch.object(hostcfgd.RSyslogCfg, 'profile_files_ready',
+                               return_value=True):
+            self.update_config('add_tls_server_no_peers')
+        state = self.host_config_daemon.state_db_conn
+        assert state.hget('SYSLOG_SERVER|10.0.0.5',
+                          'applied_transport_security') == 'false'
+        assert state.hget('SYSLOG_SERVER|10.0.0.5',
+                          'failure_reason') == 'NO_PERMITTED_PEERS'
+
     def test_profile_files_ready_requires_all_three(self):
         with mock.patch('os.path.isfile', side_effect=lambda p: p.endswith('ca-bundle.pem')):
             assert hostcfgd.RSyslogCfg.profile_files_ready('siem-east') is False
