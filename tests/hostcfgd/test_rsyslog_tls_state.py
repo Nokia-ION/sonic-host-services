@@ -65,7 +65,8 @@ def test_publish_tls_state_missing_and_ready():
     cfg = hostcfgd.RSyslogCfg(state)
     cfg.cache = {'config': {}, 'servers': {}}
     servers = {
-        '10.0.0.5': {'protocol': 'tls', 'tls_profile_id': 'siem-east'},
+        '10.0.0.5': {'protocol': 'tls', 'tls_profile_id': 'siem-east',
+                     'tls_permitted_peers': 'syslog.example.com'},
         '10.0.0.7': {'protocol': 'udp'},
         '10.0.0.9': {'protocol': 'tls'},
     }
@@ -79,11 +80,50 @@ def test_publish_tls_state_missing_and_ready():
     assert state.hget('SYSLOG_SERVER|10.0.0.9', 'failure_reason') == 'NO_PROFILE'
 
 
-def test_publish_tls_state_no_certificate():
+def test_publish_tls_state_no_permitted_peers():
+    state = FakeStateDb()
+    cfg = hostcfgd.RSyslogCfg(state)
+    cfg.cache = {'config': {}, 'servers': {}}
+    servers = {
+        '10.0.0.5': {'protocol': 'tls', 'tls_profile_id': 'siem-east'},
+        '10.0.0.6': {'protocol': 'tls', 'tls_profile_id': 'siem-east',
+                     'tls_permitted_peers': '  '},
+        '10.0.0.7': {'transport_security': 'true', 'tls_profile_id': 'siem-east'},
+    }
+    # PEMs are present, so only the missing peers explain the failure.
+    with mock.patch.object(hostcfgd.RSyslogCfg, 'profile_files_ready', return_value=True):
+        cfg._publish_tls_apply_state(servers, apply_ok=True)
+    for addr in ('10.0.0.5', '10.0.0.6', '10.0.0.7'):
+        key = 'SYSLOG_SERVER|' + addr
+        assert state.hget(key, 'applied_transport_security') == 'false'
+        assert state.hget(key, 'failure_reason') == 'NO_PERMITTED_PEERS'
+
+
+def test_publish_tls_state_no_profile_wins_over_no_permitted_peers():
+    state = FakeStateDb()
+    cfg = hostcfgd.RSyslogCfg(state)
+    cfg.cache = {'config': {}, 'servers': {}}
+    with mock.patch.object(hostcfgd.RSyslogCfg, 'profile_files_ready', return_value=True):
+        cfg._publish_tls_apply_state({'10.0.0.5': {'protocol': 'tls'}}, apply_ok=True)
+    assert state.hget('SYSLOG_SERVER|10.0.0.5', 'failure_reason') == 'NO_PROFILE'
+
+
+def test_publish_tls_state_no_permitted_peers_wins_over_no_certificate():
     state = FakeStateDb()
     cfg = hostcfgd.RSyslogCfg(state)
     cfg.cache = {'config': {}, 'servers': {}}
     servers = {'10.0.0.5': {'protocol': 'tls', 'tls_profile_id': 'siem-east'}}
+    with mock.patch.object(hostcfgd.RSyslogCfg, 'profile_files_ready', return_value=False):
+        cfg._publish_tls_apply_state(servers, apply_ok=True)
+    assert state.hget('SYSLOG_SERVER|10.0.0.5', 'failure_reason') == 'NO_PERMITTED_PEERS'
+
+
+def test_publish_tls_state_no_certificate():
+    state = FakeStateDb()
+    cfg = hostcfgd.RSyslogCfg(state)
+    cfg.cache = {'config': {}, 'servers': {}}
+    servers = {'10.0.0.5': {'protocol': 'tls', 'tls_profile_id': 'siem-east',
+                            'tls_permitted_peers': 'syslog.example.com'}}
     with mock.patch.object(hostcfgd.RSyslogCfg, 'profile_files_ready', return_value=False):
         cfg._publish_tls_apply_state(servers, apply_ok=True)
     assert state.hget('SYSLOG_SERVER|10.0.0.5', 'applied_transport_security') == 'false'
@@ -94,7 +134,8 @@ def test_publish_tls_state_apply_failed():
     state = FakeStateDb()
     cfg = hostcfgd.RSyslogCfg(state)
     cfg.cache = {'config': {}, 'servers': {}}
-    servers = {'10.0.0.5': {'protocol': 'tls', 'tls_profile_id': 'siem-east'}}
+    servers = {'10.0.0.5': {'protocol': 'tls', 'tls_profile_id': 'siem-east',
+                            'tls_permitted_peers': 'syslog.example.com'}}
     with mock.patch.object(hostcfgd.RSyslogCfg, 'profile_files_ready', return_value=True):
         cfg._publish_tls_apply_state(servers, apply_ok=False)
     assert state.hget('SYSLOG_SERVER|10.0.0.5', 'failure_reason') == 'RSYSLOG_APPLY_FAILED'

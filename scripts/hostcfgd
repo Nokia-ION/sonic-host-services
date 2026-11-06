@@ -2206,7 +2206,11 @@ class RSyslogCfg(object):
     a TLS row actually got an ossl omfwd action. Certz Finalize copies PEMs
     via ssl_profile and restarts rsyslog-config when a SYSLOG_SERVER row
     uses that tls_profile_id; rsyslog-config.sh also writes the same STATE_DB
-    fields after render.
+    fields after render. A TLS row also needs tls_permitted_peers (rsyslog
+    x509/name authentication); without it the server is skipped and
+    failure_reason is NO_PERMITTED_PEERS. The check order here must match
+    rsyslog-config.sh: NO_PROFILE, NO_PERMITTED_PEERS, NO_CERTIFICATE,
+    RSYSLOG_APPLY_FAILED.
     """
 
     SSL_CERTS_DIR = '/etc/sonic/ssl-certs'
@@ -2285,6 +2289,11 @@ class RSyslogCfg(object):
                 syslog.syslog(syslog.LOG_ERR,
                               f'RSyslogCfg: {server} TLS requested without tls_profile_id')
                 self._set_state(server, False, 'NO_PROFILE')
+                continue
+            if not str((conf or {}).get('tls_permitted_peers') or '').strip():
+                syslog.syslog(syslog.LOG_ERR,
+                              f'RSyslogCfg: {server} TLS requested without tls_permitted_peers')
+                self._set_state(server, False, 'NO_PERMITTED_PEERS')
                 continue
             if not self.profile_files_ready(profile_id):
                 syslog.syslog(syslog.LOG_ERR,
