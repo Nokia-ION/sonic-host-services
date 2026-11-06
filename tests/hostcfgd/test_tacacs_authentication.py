@@ -40,11 +40,13 @@ def render_authentication_config(
             )
             for index in range(server_count)
         ]
+    # hostcfgd resolves the source address per server, as server.source_ip
+    for server in servers:
+        server.source_ip = src_ip
 
     return template.render(
         auth={"login": login, "failthrough": failthrough},
         servers=servers,
-        src_ip=src_ip,
     )
 
 
