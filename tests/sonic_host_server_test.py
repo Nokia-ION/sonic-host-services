@@ -23,6 +23,7 @@ HANDLERS = (
     ('ssh_mgmt', 'SshMgmt', 'ssh_mgmt'),
     ('gnsi_console', 'GnsiConsole', 'gnsi_console'),
     ('glome', 'Glome', 'glome'),
+    ('ssl_profile', 'SslProfile', 'ssl_profile'),
 )
 
 
